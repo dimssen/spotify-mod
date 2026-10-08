@@ -146,11 +146,20 @@
       await new Promise((r) => setTimeout(r, Math.min(wait, 30) * 1000));
       return api(method, path, body, true);
     }
+    // Player commands (play, pause, seek…) answer with a plain-text id, not JSON, so only
+    // parse bodies that are JSON.
     const text = await res.text();
-    const data = text ? JSON.parse(text) : null;
+    let data = null;
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = null;
+      }
+    }
     if (!res.ok) {
       const err = (data && data.error) || {};
-      throw new ApiError(res.status, err.message || `Spotify error ${res.status}`, err.reason);
+      throw new ApiError(res.status, err.message || (text && !data ? text.slice(0, 200) : `Spotify error ${res.status}`), err.reason);
     }
     return data;
   }
