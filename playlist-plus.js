@@ -116,7 +116,7 @@ const PlaylistPlusCore = (() => {
       if (idx < 0) idx = 0;
       const t = pool.splice(idx, 1)[0];
       const b = trackBounds(t, trims);
-      items.push({ uri: t.uri, name: t.name || t.uri, artist: t.artist || "", start: b.start, end: b.end, length: b.length });
+      items.push({ uri: t.uri, name: t.name || t.uri, artist: t.artist || "", duration: t.duration, start: b.start, end: b.end, length: b.length });
       acc += b.length;
       last = t.uri;
     }
@@ -125,8 +125,12 @@ const PlaylistPlusCore = (() => {
 
   /**
    * Drives playback through the phases of a timed session.
-   * `player` is a small adapter (see createSpicetifyPlayer) so this can run against a fake in tests.
-   * Time only counts while music is playing, so pausing pauses the session.
+   * `player` is a small adapter (Spicetify in the desktop extension, the Web API in the phone app,
+   * a fake in tests). Time only counts while music is playing, so pausing pauses the session.
+   *
+   * Adapters with `playsUpcoming` hand Spotify the rest of the plan with each play() call, so
+   * Spotify keeps following the plan by itself while the controller can't run (phone locked);
+   * the runner then re-syncs to wherever Spotify got to.
    */
   class SessionRunner {
     constructor(player, phases, opts = {}) {
@@ -198,7 +202,8 @@ const PlaylistPlusCore = (() => {
       if (this.switching) {
         if (cur === this.expected) {
           this.switching = false;
-          if (this.item.start > 0) p.seek(this.item.start);
+          // Adapters that can start mid-song already did; otherwise jump to the trimmed start.
+          if (this.item.start > 0 && p.progress() < this.item.start - 1500) p.seek(this.item.start);
         } else {
           this.switchWait += dt;
           // Spotify never switched (unplayable track?) - move on.
@@ -207,9 +212,12 @@ const PlaylistPlusCore = (() => {
         return;
       }
 
-      // Something else is playing: the user hit next, or Spotify autoplay took over.
       if (cur !== this.expected) {
-        this._advanceTrack();
+        // Spotify moved on to a later song of the plan by itself (natural end, or the user hit next).
+        const ahead = this._findAhead(cur);
+        if (ahead) this._syncTo(ahead, dt);
+        // Something unplanned is playing: the user hit next, or Spotify autoplay took over.
+        else this._advanceTrack();
         return;
       }
 
@@ -225,12 +233,56 @@ const PlaylistPlusCore = (() => {
       const trackLeft = this.item.end - p.progress();
       const fadeMs = this.opts.fadeMs;
       if (fadeMs > 0 && phaseLeft < fadeMs && trackLeft > phaseLeft + 250) {
-        // The phase boundary will cut this track: fade it out.
+        // The phase boundary will cut this track: fade it out (if the device allows volume control).
         if (this.baseVolume == null) this.baseVolume = p.getVolume();
-        p.setVolume(this.baseVolume * Math.max(0, phaseLeft / fadeMs));
+        if (this.baseVolume != null) p.setVolume(this.baseVolume * Math.max(0, phaseLeft / fadeMs));
       }
 
-      if (trackLeft <= 250) this._advanceTrack();
+      // At a trimmed end we must cut; at a natural end Spotify moves on itself if it has the plan.
+      const trimmedEnd = this.item.duration && this.item.end < this.item.duration;
+      if (trackLeft <= 250 && (trimmedEnd || !p.playsUpcoming)) this._advanceTrack();
+    }
+
+    _findAhead(uri) {
+      if (!uri) return null;
+      for (let pi = this.phaseIdx; pi < this.phases.length; pi++) {
+        const items = this.phases[pi].items;
+        for (let i = pi === this.phaseIdx ? this.itemIdx + 1 : 0; i < items.length; i++) {
+          if (items[i].uri === uri) return { pi, i };
+        }
+      }
+      return null;
+    }
+
+    _syncTo({ pi, i }, dt) {
+      this._restoreVolume();
+      const phaseChanged = pi !== this.phaseIdx;
+      this.phaseIdx = pi;
+      this.itemIdx = i;
+      if (phaseChanged) {
+        // Estimate how far into this phase Spotify got from the planned songs before this one.
+        let est = 0;
+        for (let k = 0; k < i; k++) est += this.phase.items[k].length;
+        this.phaseElapsed = est + Math.max(0, this.player.progress() - this.item.start);
+        this._emit("phase");
+      } else if (this.player.isPlaying()) {
+        this.phaseElapsed += dt;
+      }
+      // Let the switching step apply this song's trimmed start.
+      this.expected = this.item.uri;
+      this.switching = true;
+      this.switchWait = 0;
+      this._emit("track");
+    }
+
+    /** URIs of the planned songs after the current one, for adapters that queue them. */
+    _upcoming() {
+      const out = [];
+      for (let pi = this.phaseIdx; pi < this.phases.length; pi++) {
+        const items = this.phases[pi].items;
+        for (let i = pi === this.phaseIdx ? this.itemIdx + 1 : 0; i < items.length && out.length < 99; i++) out.push(items[i].uri);
+      }
+      return out;
     }
 
     _advanceTrack() {
@@ -271,7 +323,7 @@ const PlaylistPlusCore = (() => {
       this.expected = item.uri;
       this.switching = true;
       this.switchWait = 0;
-      this.player.play(item.uri);
+      this.player.play(item.uri, item.start, this._upcoming());
       this._emit("track");
     }
 
@@ -338,12 +390,14 @@ const PlaylistPlusCore = (() => {
 })();
 
 if (typeof module !== "undefined" && module.exports) module.exports = PlaylistPlusCore;
+if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
 
 // ---------------------------------------------------------------------------
 // Spicetify integration + UI
 // ---------------------------------------------------------------------------
 (async function PlaylistPlus() {
-  if (typeof window === "undefined") return;
+  // The phone web app loads this file only for the core logic above.
+  if (typeof window === "undefined" || window.PLAYLIST_PLUS_CORE_ONLY) return;
   const ready = () =>
     window.Spicetify &&
     Spicetify.Player &&

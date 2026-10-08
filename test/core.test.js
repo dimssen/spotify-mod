@@ -169,3 +169,66 @@ test("TrimWatcher seeks to start and skips at end", () => {
   w.tick();
   assert.equal(p.uri, "spotify:track:autoplay");
 });
+
+// --- phone (Web API) mode: Spotify gets the whole plan and plays on by itself ----
+function queueingPlayer(durations) {
+  const p = fakePlayer(durations);
+  p.playsUpcoming = true;
+  p.queue = [];
+  p.play = function (uri, start, upcoming) {
+    this.queue = [uri, ...(upcoming || [])];
+    this.uri = uri;
+    this.pos = start || 0;
+    this.playing = true;
+    this.log.push(uri);
+  };
+  p.getVolume = () => null; // iPhone: no remote volume
+  p.advance = function (dt) {
+    if (!this.playing) return;
+    this.pos += dt;
+    if (this.pos >= (durations[this.uri] ?? 200000)) {
+      const i = this.queue.indexOf(this.uri);
+      this.uri = this.queue[i + 1] || "spotify:track:autoplay";
+      this.pos = 0;
+    }
+  };
+  return p;
+}
+
+test("phone mode: plays the plan from start positions, lets Spotify roll over natural ends", () => {
+  const tracks = [track(1, 100), track(2, 100), track(3, 100)];
+  const trims = { "spotify:track:t2": { start: 20000 } };
+  const p = queueingPlayer(Object.fromEntries(tracks.map((t) => [t.uri, t.duration])));
+  const items = planPhase(tracks, 5 * MIN, { shuffle: false, smartFit: false, trims });
+  const r = new SessionRunner(p, [{ name: "A", budget: 5 * MIN, pool: tracks, items }], { trims });
+  r.start();
+  assert.deepEqual(p.queue.slice(0, 3), ["spotify:track:t1", "spotify:track:t2", "spotify:track:t3"]);
+  simulate(r, p, 101000);
+  assert.equal(p.uri, "spotify:track:t2");
+  assert.equal(p.log.length, 1, "no extra play() call at a natural end");
+  assert.ok(p.pos >= 20000, "trimmed start applied after Spotify rolled over");
+  simulate(r, p, 6 * MIN);
+  assert.equal(r.active, false);
+  assert.equal(p.playing, false);
+});
+
+test("phone mode: re-syncs after the controller was suspended across a phase boundary", () => {
+  const a = [track(1, 60), track(2, 60)];
+  const b = [track(3, 60), track(4, 60), track(5, 60)];
+  const p = queueingPlayer(Object.fromEntries([...a, ...b].map((t) => [t.uri, t.duration])));
+  const phases = [
+    { name: "A", budget: 2 * MIN, pool: a, items: planPhase(a, 2 * MIN, { shuffle: false }) },
+    { name: "B", budget: 3 * MIN, pool: b, items: planPhase(b, 3 * MIN, { shuffle: false }) },
+  ];
+  const r = new SessionRunner(p, phases, {});
+  r.start();
+  r.tick(200);
+  // Phone locked: Spotify plays on for 2.5 minutes without the controller running.
+  for (let t = 0; t < 150000; t += 200) p.advance(200);
+  assert.equal(p.uri, "spotify:track:t3");
+  r.tick(150000);
+  assert.equal(r.phaseIdx, 1);
+  assert.ok(Math.abs(r.phaseElapsed - 30000) < 1000, `phaseElapsed ${r.phaseElapsed}`);
+  simulate(r, p, 4 * MIN);
+  assert.equal(r.active, false);
+});

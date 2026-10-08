@@ -3,6 +3,8 @@
   "private": true,
   "description": "Playlist Plus: a Spicetify extension that trims songs and plays timed multi-phase playlists.",
   "scripts": {
-    "test": "node --test \"test/*.test.js\""
+    "test": "node --test \"test/*.test.js\"",
+    "build:web": "node scripts/build-web.js",
+    "serve:web": "node scripts/build-web.js && python3 -m http.server 8080 -d _site"
   }
 }

@@ -1,8 +1,8 @@
 # Playlist Plus (Spotify mod)
 
-A [Spicetify](https://spicetify.app) extension for the **Spotify desktop app** that adds:
+Adds two things Spotify doesn't have:
 
-1. **Song trimming.** Set a custom start and/or end point for any song. Spotify jumps to your start point and skips to the next song at your end point, wherever the song plays.
+1. **Song trimming.** Set a custom start and/or end point for any song. Spotify jumps to your start point and skips to the next song at your end point.
 2. **Timed sessions.** Pick a total length (say 50 minutes) and split it into phases, each with its own playlist:
 
    | Phase     | Playlist           | Time            |
@@ -11,11 +11,46 @@ A [Spicetify](https://spicetify.app) extension for the **Spotify desktop app** t
    | Normal    | *Running mix*      | 36 minutes      |
    | Cool-down | *Chill*            | remaining time  |
 
-   Press **Start**. Each phase plays songs from its playlist for its share of the time, then moves to the next phase. The session stops when the time is up. When a phase boundary cuts a song short, the song fades out.
+   Press **Start**. Each phase plays songs from its playlist for its share of the time, then moves to the next phase. The session stops when the time is up.
 
-## Install
+It comes in two versions that share the same playback logic:
 
-You need the Spotify **desktop** app (Windows, macOS or Linux). Spicetify can't modify the phone app.
+- **[iPhone / Android](#phone-iphone-android):** a web app you add to your home screen. It remote-controls the Spotify app on your phone.
+- **[Desktop](#desktop-windows-macos-linux):** a [Spicetify](https://spicetify.app) extension that runs inside the Spotify desktop app.
+
+## Phone (iPhone, Android)
+
+Apple doesn't allow modifying the Spotify app on iPhone. So the phone version is a separate web app that controls Spotify through Spotify's official remote-control API (the same API "Spotify Connect" remotes use). Spotify Premium is required.
+
+### One-time setup
+
+1. **Turn on hosting** (repository owner, once): on GitHub, open this repository's **Settings → Pages** and set **Source** to **GitHub Actions**. Then re-run the latest "Deploy phone app to GitHub Pages" workflow under **Actions**, or push any commit. The app is published at **https://dimssen.github.io/spotify-mod/**.
+2. **Create a Spotify app key.** Spotify requires every app to have one, and it's free. Open the web app; it shows these steps too.
+   1. Go to [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard) and log in.
+   2. **Create app**. Any name and description will do.
+   3. Under **Redirect URIs**, add `https://dimssen.github.io/spotify-mod/` exactly.
+   4. Under **APIs used**, tick **Web API**, then save.
+   5. Copy the **Client ID** into the web app, then tap **Connect Spotify**.
+3. **Add it to your home screen:** in Safari, tap **Share → Add to Home Screen**. It then opens full-screen like a normal app.
+
+### Use
+
+- **Timed session:** open the **Session** tab, give each phase a playlist and a length, and tap **Start session**. Spotify on your phone starts playing the plan. The app shows the current phase and the time left, and keeps the screen awake while the session runs.
+- **Trim a song:** play it in Spotify, open the **Trims** tab, and tap **Trim the song that's playing**. Use the **Now** buttons to capture the start and end while you listen. You can also pick any song from one of your playlists.
+- **Copy trims from desktop:** in the desktop extension's **Trimmed songs** tab, use **Export**. Send yourself the text and use **Import** on the phone. The phone app has the same export and import, and both versions use the same format.
+
+### Phone limitations (from iOS and Spotify, not fixable in the app)
+
+- **The app has to be open for trims and exact phase timing.** iOS pauses web apps that are in the background or when the screen locks. During a session the app keeps the screen on for this reason, so leave it open (a phone on an armband or a treadmill works fine).
+  - If you lock the phone anyway, Spotify keeps playing the planned songs in order, so the music still moves through warm-up, normal and cool-down. While the phone is locked, songs play untrimmed and phase changes happen at song boundaries. When you open the app again it catches up.
+  - Outside sessions, trims only apply while the app is open.
+- **Only playlists you created or collaborate on can be used.** Since February 2026, Spotify doesn't let personal apps read other people's playlists, including Spotify's own. To use one, create a playlist and add its songs to it (select all, then **Add to playlist**).
+- **No fade-out on iPhone.** iPhones don't allow remote volume control, so cut songs stop without fading. Fades work when Spotify plays on a computer or speaker.
+- **Trims and templates are stored per device.** Use Export and Import to copy them across.
+
+## Desktop (Windows, macOS, Linux)
+
+### Install
 
 1. **Install Spicetify** (skip this if you already have it):
    - Windows (PowerShell): `iwr -useb https://raw.githubusercontent.com/spicetify/cli/main/install.ps1 | iex`
@@ -35,14 +70,14 @@ Spotify updates undo Spicetify's changes. After an update, run `spicetify backup
 
 To uninstall, run `spicetify config extensions playlist-plus.js-` and then `spicetify apply`. To remove Spicetify completely, run `spicetify restore`.
 
-## Use
+### Use
 
-### Trim a song
+#### Trim a song
 Right-click a song, choose **Trim song…**, and enter a start and/or end time (`m:ss`). If the song is playing, **Use current position** fills in the current playback position. **Preview start** and **Preview end** let you check the cut points.
 
 To see, edit, back up or import all your trims, open the **Playlist Plus** button (the clock icon in the top bar) and go to the **Trimmed songs** tab.
 
-### Timed session
+#### Timed session
 1. Click the **Playlist Plus** clock icon in the top bar.
 2. Set the session length, then give each phase a playlist (choose one from your library or paste a link) and an amount of time:
    - **minutes**: a fixed length.
@@ -62,12 +97,17 @@ Notes:
 
 ## Development
 
-The playback logic (time budgets, track planning, the session runner and the trim watcher) is pure JavaScript at the top of `playlist-plus.js`. It is unit-tested in Node against a simulated player:
+- `playlist-plus.js`: the desktop extension. The top of the file is the shared core (time budgets, track planning, the session runner and the trim watcher). It's pure JavaScript with no Spotify dependencies.
+- `web/`: the phone app (`index.html`, `app.js`). It loads the core from `playlist-plus.js` and talks to the Spotify Web API.
+- `.github/workflows/pages.yml`: runs the tests, builds `_site/` and deploys it to GitHub Pages.
 
 ```sh
-npm test
+npm test            # core logic, tested against simulated desktop and phone players
+npm run serve:web   # build and serve the phone app at http://127.0.0.1:8080
 ```
+
+To log in to a local copy, add `http://127.0.0.1:8080/` as a Redirect URI in your Spotify app. Spotify accepts plain http only on 127.0.0.1.
 
 ## Disclaimer
 
-Spicetify modifies the Spotify desktop client. Spotify's terms don't allow client modifications, but Spicetify is widely used. You use it at your own risk. This mod uses your normal Premium playback and doesn't bypass anything.
+The desktop version uses Spicetify, which modifies the Spotify desktop client. Spotify's terms don't allow client modifications, but Spicetify is widely used; you use it at your own risk. The phone version only uses Spotify's official Web API. Both use your normal Premium playback and don't bypass anything.
