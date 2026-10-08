@@ -148,7 +148,7 @@ test("SessionRunner plays phases for their budgets and stops at the end", () => 
   assert.ok(Math.abs(t - 20 * MIN) < 10000, `ended at ${t}`);
   assert.ok(Math.abs(firstSeen[1] - 3 * MIN) < 5000, `phase 2 at ${firstSeen[1]}`);
   assert.ok(Math.abs(firstSeen[2] - 15 * MIN) < 8000, `phase 3 at ${firstSeen[2]}`);
-  assert.deepEqual(events.filter((e) => e[0] !== "track"), [["phase", 1], ["phase", 2], ["finish", 3]]);
+  assert.deepEqual(events.filter((e) => e[0] !== "track").map((e) => e[0]), ["phase", "phase", "finish"]);
   assert.equal(p.volume, 1, "volume restored after fade");
   // Cool-down only ever plays cool-down tracks.
   assert.ok(phases[2].items.every((i) => i.uri === "spotify:track:t6"));
@@ -231,8 +231,13 @@ test("phone mode: plays the plan from start positions, lets Spotify roll over na
   assert.deepEqual(p.queue.slice(0, 3), ["spotify:track:t1", "spotify:track:t2", "spotify:track:t3"]);
   simulate(r, p, 101000);
   assert.equal(p.uri, "spotify:track:t2");
-  assert.equal(p.log.length, 1, "no extra play() call at a natural end");
-  assert.ok(p.pos >= 20000, "trimmed start applied after Spotify rolled over");
+  // t2 starts at a trim point, so the runner hands over itself (no intro heard)...
+  assert.deepEqual(p.log, ["spotify:track:t1", "spotify:track:t2"]);
+  assert.ok(p.pos >= 20000, "t2 starts at its trimmed start");
+  // ...while the untrimmed t2 -> t3 change is left to Spotify (keeps its crossfade).
+  simulate(r, p, 81000);
+  assert.equal(p.uri, "spotify:track:t3");
+  assert.equal(p.log.length, 2, "no play() call at a natural song change");
   simulate(r, p, 6 * MIN);
   assert.equal(r.active, false);
   assert.equal(p.playing, false);
@@ -257,4 +262,106 @@ test("phone mode: re-syncs after the controller was suspended across a phase bou
   assert.ok(Math.abs(r.phaseElapsed - 30000) < 1000, `phaseElapsed ${r.phaseElapsed}`);
   simulate(r, p, 4 * MIN);
   assert.equal(r.active, false);
+});
+
+// --- smooth transitions ----------------------------------------------------------
+const { planPhaseSmooth, planSession } = core;
+
+function lcg(seed) {
+  let x = seed;
+  return () => ((x = (x * 1664525 + 1013904223) % 4294967296) / 4294967296);
+}
+const randomTracks = (rng, n, prefix) => Array.from({ length: n }, (_, i) => track(`${prefix}${i}`, 150 + Math.floor(rng() * 150)));
+
+test("smooth planning ends phases on song boundaries close to the target", () => {
+  for (let seed = 1; seed <= 30; seed++) {
+    const rng = lcg(seed);
+    const tracks = randomTracks(rng, 25, "s");
+    for (const target of [6 * MIN, 36 * MIN, 8 * MIN]) {
+      const items = planPhaseSmooth(tracks, target, { rng });
+      const total = items.reduce((a, i) => a + i.length, 0);
+      assert.ok(Math.abs(total - target) <= Math.max(15000, Math.min(60000, target * 0.12)), `seed ${seed}: ${total} vs ${target}`);
+      for (let i = 1; i < items.length; i++) assert.notEqual(items[i].uri, items[i - 1].uri);
+    }
+  }
+});
+
+test("planSession smooth carries drift so the whole session stays on time", () => {
+  for (let seed = 1; seed <= 20; seed++) {
+    const rng = lcg(seed);
+    const defs = [
+      { name: "Warm-up", pool: randomTracks(rng, 8, "w"), budget: 6 * MIN },
+      { name: "Normal", pool: randomTracks(rng, 30, "n"), budget: 36 * MIN },
+      { name: "Cool-down", pool: randomTracks(rng, 8, "c"), budget: 8 * MIN },
+    ];
+    const phases = planSession(defs, { mode: "smooth", rng });
+    const total = phases.reduce((a, p) => a + p.budget, 0);
+    assert.ok(Math.abs(total - 50 * MIN) <= 60000, `seed ${seed}: session ${total / 1000}s`);
+    for (const p of phases) assert.equal(p.budget, p.items.reduce((a, i) => a + i.length, 0));
+  }
+});
+
+test("smooth session on a phone: Spotify plays it all by itself, then it stops", () => {
+  const a = [track(1, 120), track(2, 120), track(3, 120)];
+  const b = [track(4, 180), track(5, 180)];
+  const durations = Object.fromEntries([...a, ...b].map((t) => [t.uri, t.duration]));
+  const p = queueingPlayer(durations);
+  const phases = planSession([{ name: "A", pool: a, budget: 4 * MIN }, { name: "B", pool: b, budget: 6 * MIN }], { mode: "smooth", shuffle: false });
+  const r = new SessionRunner(p, phases, { smooth: true, crossfadeMs: 2000 });
+  r.start();
+  const events = [];
+  r.opts.onEvent = (type) => events.push(type);
+  simulate(r, p, 11 * MIN);
+  assert.equal(r.active, false);
+  assert.equal(p.playing, false, "paused at the end, not playing autoplay");
+  assert.equal(p.log.length, 1, "one play() for the whole session: every change was a natural one");
+  assert.ok(!p.log.includes("spotify:track:autoplay"));
+  assert.ok(events.includes("phase") && events.includes("finish"));
+});
+
+test("smooth session works even if the controller sleeps through it", () => {
+  const a = [track(1, 120), track(2, 120)];
+  const b = [track(3, 180), track(4, 180)];
+  const p = queueingPlayer(Object.fromEntries([...a, ...b].map((t) => [t.uri, t.duration])));
+  const phases = planSession([{ name: "A", pool: a, budget: 4 * MIN }, { name: "B", pool: b, budget: 6 * MIN }], { mode: "smooth", shuffle: false });
+  const r = new SessionRunner(p, phases, { smooth: true });
+  r.start();
+  r.tick(200);
+  for (let t = 0; t < 5 * MIN; t += 200) p.advance(200); // phone locked for 5 minutes
+  r.tick(5 * MIN);
+  assert.equal(r.phaseIdx, 1);
+  const st = r.status();
+  assert.ok(Math.abs(st.totalLeft - 5 * MIN) < 2000, `left ${st.totalLeft}`);
+});
+
+test("volume is restored only after the next song has started", () => {
+  const tracks = [track(1, 100), track(2, 100)];
+  const trims = { "spotify:track:t1": { start: 0, end: 60000 } };
+  const p = fakePlayer({ "spotify:track:t1": 100000, "spotify:track:t2": 100000 });
+  const volumes = [];
+  p.setVolume = function (v) { this.volume = v; volumes.push([this.uri, Math.round(v * 100)]); };
+  const items = planPhase(tracks, 3 * MIN, { shuffle: false, smartFit: false, trims });
+  const r = new SessionRunner(p, [{ name: "A", budget: 3 * MIN, pool: tracks, items }], { trims, fadeMs: 3000 });
+  r.start();
+  simulate(r, p, 62000);
+  const restoreAt = volumes.findIndex(([, v]) => v === 100);
+  assert.ok(restoreAt > 0, "faded, then restored");
+  assert.equal(volumes[restoreAt][0], "spotify:track:t2", "restored while the new song plays");
+  assert.ok(volumes.slice(0, restoreAt).every(([u]) => u === "spotify:track:t1"));
+});
+
+test("snapshot/restore continues a session where Spotify is", () => {
+  const a = [track(1, 120), track(2, 120)];
+  const p = queueingPlayer(Object.fromEntries(a.map((t) => [t.uri, t.duration])));
+  const phases = planSession([{ name: "A", pool: a, budget: 4 * MIN }], { mode: "smooth", shuffle: false });
+  const r1 = new SessionRunner(p, phases, { smooth: true });
+  r1.start();
+  r1.tick(200);
+  const snap = JSON.parse(JSON.stringify(r1.snapshot()));
+  for (let t = 0; t < 150000; t += 200) p.advance(200); // app closed; Spotify moved to song 2
+  const r2 = SessionRunner.restore(p, snap);
+  r2.tick(200);
+  assert.equal(r2.itemIdx, 1);
+  simulate(r2, p, 3 * MIN);
+  assert.equal(r2.active, false);
 });

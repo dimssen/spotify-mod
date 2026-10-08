@@ -1,7 +1,7 @@
 // Playlist Plus for phones: controls the Spotify app on this phone (or any Spotify device)
 // through the Spotify Web API. Shares its playback logic with the desktop extension.
 (() => {
-  const { parseTime, formatTime, normalizePlaylistUri, computeBudgets, planPhase, SessionRunner, TrimWatcher, phaseColor } = window.PlaylistPlusCore;
+  const { parseTime, formatTime, normalizePlaylistUri, computeBudgets, planSession, SessionRunner, TrimWatcher, phaseColor } = window.PlaylistPlusCore;
 
   // ----- storage (same keys and formats as the desktop extension) -----------
   const KEY = {
@@ -12,6 +12,7 @@
     clientId: "playlist-plus:client-id",
     auth: "playlist-plus:auth",
     verifier: "playlist-plus:pkce-verifier",
+    session: "playlist-plus:session",
   };
   const load = (k, fallback) => {
     try {
@@ -30,13 +31,14 @@
   };
 
   let trims = load(KEY.trims, {});
-  let settings = { trimsEnabled: true, trimsInSessions: true, fadeSeconds: 3, ...load(KEY.settings, {}) };
+  let settings = { trimsEnabled: true, trimsInSessions: true, fadeSeconds: 3, crossfadeSeconds: 0, ...load(KEY.settings, {}) };
   const defaultTemplate = () => ({
     id: String(Date.now()),
     name: "50-minute workout",
     totalMin: 50,
     shuffle: true,
     smartFit: true,
+    transitions: "smooth",
     phases: [
       { name: "Warm-up", playlistUri: "", mode: "minutes", value: 6 },
       { name: "Normal", playlistUri: "", mode: "minutes", value: 36 },
@@ -236,8 +238,13 @@
       if (this.polling) return this.polling;
       this.polling = (async () => {
         try {
+          const t0 = Date.now();
           const d = await api("GET", "/me/player?additional_types=episode");
-          this.fetchedAt = Date.now();
+          const t1 = Date.now();
+          // A reply that was in flight while we sent a command describes the old state: ignore it.
+          if (t0 < this.lastCommandAt) return;
+          // The position was measured somewhere between sending and receiving.
+          this.fetchedAt = Math.round((t0 + t1) / 2);
           this.state =
             d && d.item
               ? {
@@ -263,21 +270,37 @@
       return this.polling;
     },
     pollSoon() {
-      setTimeout(() => this.poll(), 600);
+      setTimeout(() => this.poll(), 350);
     },
 
+    // Commands run one at a time, in order, so e.g. "pause" never overtakes "restore volume".
+    queue: Promise.resolve(),
+    lastCommandAt: 0,
+    rtt: 400,
+    // How early to send a command so it lands on time.
+    get leadMs() {
+      return Math.max(150, Math.min(1500, Math.round(this.rtt * 0.6 + 80)));
+    },
     command(method, path, body) {
-      api(method, path, body)
+      this.lastCommandAt = Date.now();
+      this.queue = this.queue
+        .then(async () => {
+          const t0 = Date.now();
+          await api(method, path, body);
+          this.rtt = this.rtt * 0.7 + (Date.now() - t0) * 0.3;
+          this.lastCommandAt = Date.now();
+        })
         .catch((e) => {
-          if (e.reason === "NO_ACTIVE_DEVICE" || e.status === 404) toast("No active Spotify device. Open Spotify on your phone, play any song, then try again.", true);
+          if (e.reason === "NO_ACTIVE_DEVICE" || e.status === 404) toast("Spotify isn't open on any device. Open Spotify, then try again.", true);
           else if (e.reason !== "VOLUME_CONTROL_DISALLOW") toast(e.message, true);
         })
         .finally(() => this.pollSoon());
+      return this.queue;
     },
 
     play(uri, start, upcoming) {
       const uris = [uri, ...(upcoming || [])].slice(0, 100);
-      this.command("PUT", `/me/player/play${this.deviceQuery()}`, { uris, position_ms: Math.round(start || 0) });
+      return this.command("PUT", `/me/player/play${this.deviceQuery()}`, { uris, position_ms: Math.round(start || 0) });
     },
     seek(ms) {
       if (this.state) {
@@ -613,6 +636,7 @@
     activeTemplateId = tpl.id;
     const root = h("div");
     const persist = () => saveTemplates();
+    const smooth = () => tpl.transitions !== "exact";
     const err = h("div", { className: "err" });
     const timeline = h("div");
     let busy = false;
@@ -703,12 +727,33 @@
           } }, icon("plus"), "New"),
         ),
 
+        resumeCard(),
+
         h("h2", null, "Length"),
         h("div", { className: "card" },
           lengthRange,
           timeline,
         ),
         err,
+
+        h("h2", null, "Transitions"),
+        h("div", { className: "card" },
+          h("div", { className: "seg wide" },
+            h("button", { className: smooth() ? "on" : "", onClick: () => ((tpl.transitions = "smooth"), persist(), draw()) }, "Smooth"),
+            h("button", { className: smooth() ? "" : "on", onClick: () => ((tpl.transitions = "exact"), persist(), draw()) }, "Exact"),
+          ),
+          smooth()
+            ? h("div", { className: "feature-list" },
+                h("div", null, icon("check"), "Phases change between songs, close to your timing; the session as a whole ends on time"),
+                h("div", null, icon("check"), "No song gets cut, so Spotify's crossfade (if on) blends every change"),
+                h("div", null, icon("check"), "Plays on its own: lock your phone any time"),
+              )
+            : h("div", { className: "feature-list" },
+                h("div", null, icon("timer"), "Phases change exactly on the minute"),
+                h("div", { className: "warn" }, icon("info"), "The song playing at a phase change gets cut (iPhones can't fade it)"),
+                h("div", { className: "warn" }, icon("info"), "Keep Playlist Plus open for the cuts to happen on time"),
+              ),
+        ),
 
         h("h2", null, "Phases"),
         tpl.phases.map((ph, i) => phaseCard(ph, i)),
@@ -800,8 +845,7 @@
 
     async function buildPlan() {
       const budgets = computeBudgets(Number(tpl.totalMin) * 60000, tpl.phases);
-      const trimMap = settings.trimsInSessions ? trims : {};
-      const phases = [];
+      const defs = [];
       for (let i = 0; i < tpl.phases.length; i++) {
         const ph = tpl.phases[i];
         if (budgets[i] <= 0) continue;
@@ -813,11 +857,17 @@
           throw new Error(`${ph.name}: ${e.message}`);
         }
         if (!pool.length) throw new Error(`The playlist for “${ph.name}” has no playable songs.`);
-        const prev = phases.length ? phases[phases.length - 1].items.slice(-1)[0] : null;
-        const items = planPhase(pool, budgets[i], { shuffle: tpl.shuffle, smartFit: tpl.smartFit, trims: trimMap, prevUri: prev && prev.uri });
-        phases.push({ name: ph.name, color: phaseColor(i), budget: budgets[i], pool, items });
+        defs.push({ name: ph.name, color: phaseColor(i), pool, budget: budgets[i] });
       }
-      if (!phases.length) throw new Error("No phase has any time assigned.");
+      if (!defs.length) throw new Error("No phase has any time assigned.");
+      const phases = planSession(defs, {
+        mode: smooth() ? "smooth" : "exact",
+        shuffle: tpl.shuffle,
+        smartFit: tpl.smartFit,
+        trims: settings.trimsInSessions ? trims : {},
+      });
+      phases.mode = smooth() ? "smooth" : "exact";
+      phases.title = tpl.name;
       return phases;
     }
 
@@ -838,8 +888,17 @@
     }
 
     function showPlan(phases) {
+      const total = phases.reduce((a, p) => a + p.budget, 0);
+      const trimmed = phases.reduce((a, p) => a + p.items.filter((i) => i.length < i.duration).length, 0);
+      const note = (ic, text, cls = "") => h("div", { className: `note ${cls}` }, icon(ic), h("div", null, text));
       const close = openSheet(h("div", null,
-        h("h3", null, `${tpl.name} · ${tpl.totalMin} min`),
+        h("h3", null, `${tpl.name} · ${formatTime(total)}`),
+        smooth()
+          ? trimmed
+            ? note("scissors", `${trimmed} trimmed song${trimmed === 1 ? "" : "s"}: keep Playlist Plus open so they're trimmed. If your phone locks, they play in full and the session carries on.`)
+            : note("check", "Every change happens between songs, so Spotify plays this on its own. Lock your phone any time.", "good")
+          : note("info", "Exact timing cuts songs at phase changes. Keep Playlist Plus open during the session."),
+        smooth() && !settings.crossfadeSeconds && note("info", "Tip: turn on Crossfade in Spotify (Settings → Playback), then set the same value in Playlist Plus Settings, for seamless fades between songs."),
         phases.map((ph) => {
           let t = 0;
           const rows = [];
@@ -861,7 +920,7 @@
             h("div", { className: "row", style: `--c:${ph.color}` },
               h("span", { style: `width:10px;height:10px;border-radius:50%;background:${ph.color}` }),
               h("b", { className: "grow" }, ph.name),
-              h("span", { className: "sub tnum" }, formatTime(ph.budget)),
+              h("span", { className: "sub tnum" }, formatTime(ph.budget), smooth() && Math.abs(ph.budget - ph.target) >= 1000 ? h("span", { className: "tiny" }, ` (${ph.budget > ph.target ? "+" : "−"}${formatTime(Math.abs(ph.budget - ph.target))})`) : null),
             ),
             h("div", { className: "list" }, rows),
           );
@@ -943,6 +1002,8 @@
         }
         upcoming.push({ ...runner.phases[pi].items[ii], phase: runner.phases[pi] });
       }
+      // Warm the image cache so the next song's artwork appears instantly.
+      upcoming.forEach((u) => u.art && (new Image().src = u.art));
       const nextPhase = runner.phases[st.phaseIdx + 1];
       fill(root,
         h("div", { className: "eyebrow" }, `Phase ${st.phaseIdx + 1} of ${st.phaseCount}`),
@@ -970,9 +1031,7 @@
           h("button", { className: "icon-btn", "aria-label": "Next song", onClick: () => runner.skipTrack() }, icon("next")),
           h("button", { className: "icon-btn", "aria-label": "Next phase", disabled: !nextPhase, onClick: () => runner.skipPhase() }, icon("forward")),
         ),
-        nextPhase && h("div", { style: "text-align:center;margin-top:4px" },
-          h("span", { className: "tiny" }, `Up next: ${nextPhase.name} · ${formatTime(nextPhase.budget)}`),
-        ),
+        nextPhase && h("div", { style: "text-align:center;margin-top:4px" }, (r.nextLabel = h("span", { className: "tiny tnum" }))),
         upcoming.length > 0 && h("h2", null, "Next in queue"),
         h("div", { className: "list" }, upcoming.map((u) =>
           h("div", { className: "item" },
@@ -989,6 +1048,11 @@
     const r = live.refs;
     r.countdown.textContent = formatTime(st.phaseLeft);
     r.sub.textContent = `left in ${st.phaseName} · ${formatTime(st.totalLeft)} left in session`;
+    if (r.nextLabel) {
+      const np = runner.phases[st.phaseIdx + 1];
+      const lastSong = runner.opts.smooth && runner.itemIdx === runner.phase.items.length - 1;
+      r.nextLabel.textContent = lastSong ? `${np.name} starts after this song` : `Next: ${np.name} in ${formatTime(st.phaseLeft)}`;
+    }
     runner.phases.forEach((p, i) => {
       const pct = i < st.phaseIdx ? 100 : i > st.phaseIdx ? 0 : Math.min(100, ((p.budget - st.phaseLeft) / p.budget) * 100);
       r[`seg${i}`].style.setProperty("--p", `${pct}%`);
@@ -1196,6 +1260,11 @@
       e.target.value = settings.fadeSeconds;
       saveSettings();
     } });
+    const xfIn = h("input", { type: "number", inputmode: "numeric", value: settings.crossfadeSeconds, "aria-label": "Spotify crossfade seconds", onChange: (e) => {
+      settings.crossfadeSeconds = Math.max(0, Math.min(12, Number(e.target.value) || 0));
+      e.target.value = settings.crossfadeSeconds;
+      saveSettings();
+    } });
     const fadeStep = (d) => () => {
       settings.fadeSeconds = Math.max(0, Math.min(15, settings.fadeSeconds + d));
       fadeIn.value = settings.fadeSeconds;
@@ -1286,7 +1355,15 @@
       h("h2", null, "Playback"),
       switchSetting("trimsEnabled", "Trim songs while listening", "Applies your trims whenever this app is open."),
       switchSetting("trimsInSessions", "Trim songs in timed sessions", null),
-      setting("Fade out cut songs", "When a phase ends mid-song. Works on computers and speakers; iPhones don't allow remote volume.",
+      setting("Crossfade in Spotify", "Set the same value as Spotify → Settings → Playback → Crossfade. Sessions then end cleanly, and trimmed songs hand over at the right moment.",
+        h("div", { className: "stepper" },
+          h("button", { "aria-label": "Shorter", onClick: () => ((settings.crossfadeSeconds = Math.max(0, settings.crossfadeSeconds - 1)), saveSettings(), (xfIn.value = settings.crossfadeSeconds)) }, icon("minus")),
+          xfIn,
+          h("span", { className: "unit" }, "s"),
+          h("button", { "aria-label": "Longer", onClick: () => ((settings.crossfadeSeconds = Math.min(12, settings.crossfadeSeconds + 1)), saveSettings(), (xfIn.value = settings.crossfadeSeconds)) }, icon("plus")),
+        ),
+      ),
+      setting("Fade out cut songs", "Volume fade before a trim end or an exact phase change. Works when Spotify plays on a computer or speaker; iPhones don't allow it, so use Smooth transitions there.",
         h("div", { className: "stepper" },
           h("button", { "aria-label": "Shorter", onClick: fadeStep(-1) }, icon("minus")),
           fadeIn,
@@ -1328,24 +1405,121 @@
     }
   };
 
-  function startSession(phases) {
+  const runnerOpts = (extra = {}) => ({
+    fadeMs: settings.fadeSeconds * 1000,
+    crossfadeMs: settings.crossfadeSeconds * 1000,
+    trims: settings.trimsInSessions ? trims : {},
+    onEvent: (type, r) => {
+      if (type === "phase") toast(`Now: ${r.phase.name}`);
+      if (type === "finish") {
+        toast("Session complete 🎉");
+        clearSession();
+        if (wakeLock) wakeLock.release();
+        if (tab === "session") renderTab();
+      }
+      if (type === "phase" || type === "track") saveSession();
+      live.key = null;
+      updateLive();
+    },
+    ...extra,
+  });
+
+  // A session survives iOS closing the app: it's saved as it goes and offered (or quietly
+  // resumed) on the next launch.
+  let sessionTitle = "";
+  function saveSession() {
+    if (!(runner && runner.active)) return;
+    const snap = runner.snapshot();
+    // Smooth sessions never re-plan, so the (possibly large) playlists needn't be stored.
+    if (snap.opts.smooth) snap.phases = snap.phases.map(({ pool, ...p }) => p);
+    save(KEY.session, { ...snap, title: sessionTitle, savedAt: Date.now() });
+  }
+  function clearSession() {
+    localStorage.removeItem(KEY.session);
+  }
+  function savedSession() {
+    const snap = load(KEY.session, null);
+    if (!snap || !snap.phases || Date.now() - snap.savedAt > 4 * 3600 * 1000) return null;
+    return snap;
+  }
+  function resumeSession(snap) {
     if (runner) runner.stop();
-    runner = new SessionRunner(player, phases, {
-      fadeMs: settings.fadeSeconds * 1000,
-      trims: settings.trimsInSessions ? trims : {},
-      onEvent: (type, r) => {
-        if (type === "phase") toast(`Now: ${r.phase.name}`);
-        if (type === "finish") {
-          toast("Session complete 🎉");
-          if (wakeLock) wakeLock.release();
-          if (tab === "session") renderTab();
+    runner = SessionRunner.restore(player, snap, runnerOpts());
+    // Exact sessions count the time that passed while the app was closed, if music played.
+    if (!snap.opts.smooth && player.isPlaying()) runner.phaseElapsed += Math.min(Date.now() - snap.savedAt, 3600 * 1000);
+    sessionTitle = snap.title || "";
+    lastTick = Date.now();
+    keepAwake();
+    tab = "session";
+    render();
+  }
+  function resumeCard() {
+    const snap = !(runner && runner.active) && savedSession();
+    if (!snap) return null;
+    const ph = snap.phases[snap.phaseIdx];
+    return h("div", { className: "card resume", style: `--c:${(ph && ph.color) || phaseColor(snap.phaseIdx)}` },
+      h("div", { className: "tiny", style: "font-weight:700;text-transform:uppercase;letter-spacing:.08em" }, "Session in progress"),
+      h("div", { style: "font-size:18px;font-weight:800;margin:2px 0 10px" }, `${snap.title || "Timed session"} · ${ph ? ph.name : ""}`),
+      h("div", { className: "row" },
+        h("button", { className: "btn small", onClick: () => resumeSession(snap) }, icon("play"), "Resume"),
+        h("button", { className: "btn outline small", onClick: () => (clearSession(), renderTab()) }, "Discard"),
+      ),
+    );
+  }
+
+  // Make sure Spotify is open somewhere we can play to; if not, help the user open it.
+  async function findDevice() {
+    await player.poll();
+    if (player.state && player.state.device) return true;
+    try {
+      const { devices } = await api("GET", "/me/player/devices");
+      const pick = devices.find((d) => d.is_active) || devices.find((d) => d.type === "Smartphone") || devices[0];
+      if (pick) {
+        player.chosenDevice = pick.id;
+        return true;
+      }
+    } catch {
+      /* fall through */
+    }
+    return false;
+  }
+  async function ensureDevice() {
+    if (await findDevice()) return true;
+    return new Promise((resolve) => {
+      let ok = false;
+      const check = async () => {
+        if (document.hidden) return;
+        if (await findDevice()) {
+          ok = true;
+          close();
         }
-        live.key = null;
-        updateLive();
-      },
+      };
+      document.addEventListener("visibilitychange", check);
+      const close = openSheet(h("div", null,
+        h("h3", null, "Open Spotify first"),
+        h("p", { className: "sub" }, "Playlist Plus plays your session in the Spotify app. Open Spotify, then come back here and the session starts."),
+        h("div", { className: "spacer" }),
+        h("a", { className: "btn block", href: "spotify:" }, "Open Spotify"),
+        h("div", { className: "spacer" }),
+        h("button", { className: "btn outline block", onClick: async () => {
+          await check();
+          if (!ok) toast("Still can't find Spotify. Is it open on your phone?", true);
+        } }, "I'm back, start"),
+      ), { onClose: () => {
+        document.removeEventListener("visibilitychange", check);
+        resolve(ok);
+      } });
     });
+  }
+
+  async function startSession(phases) {
+    if (!(await ensureDevice())) return;
+    if (runner) runner.stop();
+    runner = new SessionRunner(player, phases, runnerOpts({ smooth: phases.mode === "smooth" }));
+    sessionTitle = phases.title || "";
     lastTick = Date.now();
     runner.start();
+    saveSession();
     keepAwake();
     toast(`Starting ${phases[0].name}`);
     tab = "session";
@@ -1358,6 +1532,7 @@
     if (ask && !(await confirmSheet("End this session?", "The music keeps playing; the timer stops.", "End session"))) return;
     runner.stop();
     runner = null;
+    clearSession();
     if (wakeLock) wakeLock.release();
     toast("Session ended");
     if (tab === "session") renderTab();
@@ -1388,13 +1563,33 @@
       lastLive = now;
       updateLive();
     }
+    if (sessionOn && now - lastSaved > 5000) {
+      lastSaved = now;
+      saveSession();
+    }
+  }
+  let lastSaved = 0;
+
+  // Poll faster when something is about to happen (a cut, a hand-over, a trim), so it lands on time.
+  function msToNextAction() {
+    const s = player.state;
+    if (!s || !s.playing) return Infinity;
+    const pos = player.progress();
+    if (runner && runner.active) {
+      const item = runner.item;
+      return item ? Math.min(item.end - pos, runner.opts.smooth ? Infinity : runner.phaseLeft()) : Infinity;
+    }
+    // Outside sessions: a trim end coming up, or a song ending (the next one may have a trimmed start).
+    const t = settings.trimsEnabled && trims[s.uri];
+    return Math.min(t && t.end ? t.end - pos : Infinity, s.duration ? s.duration - pos : Infinity);
   }
 
   async function pollLoop() {
     for (;;) {
       if (auth && !document.hidden) await player.poll();
       const busy = (runner && runner.active) || (settings.trimsEnabled && Object.keys(trims).length);
-      await new Promise((r) => setTimeout(r, busy ? 1000 : 3000));
+      const soon = msToNextAction() < 8000;
+      await new Promise((r) => setTimeout(r, soon ? 400 : busy ? 1000 : 3000));
     }
   }
 
@@ -1414,9 +1609,17 @@
     }
     render();
     if (auth) {
-      setInterval(tick, 200);
+      setInterval(tick, 100);
       pollLoop();
-      player.poll().then(updateLive);
+      await player.poll();
+      updateLive();
+      // iOS often closes a backgrounded web app. If a session was running a moment ago and
+      // Spotify is still playing it, carry on as if nothing happened; otherwise offer to resume.
+      const snap = savedSession();
+      if (snap && player.state) {
+        const uris = new Set(snap.phases.flatMap((p) => p.items.map((i) => i.uri)));
+        if (uris.has(player.state.uri)) resumeSession(snap);
+      }
     }
   })();
 })();

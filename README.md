@@ -33,6 +33,20 @@ Apple doesn't allow modifying the Spotify app on iPhone. So the phone version is
    5. Copy the **Client ID** into the web app, then tap **Connect Spotify**.
 3. **Add it to your home screen:** in Safari, tap **Share → Add to Home Screen**. It then opens full-screen like a normal app.
 
+### Smooth transitions (the default on phones)
+
+iPhones don't let apps change Spotify's volume, and Spotify's crossfade only applies when a song ends by itself, never when an app skips it. So on a phone the smoothest session is one where no song gets cut. With **Transitions → Smooth**:
+
+- Each phase ends where a song ends. Playlist Plus picks songs whose lengths add up to the phase's time, and tries several shuffles to find the closest fit. Any small difference carries over into the next phase, so the session as a whole ends on time; with reasonably sized playlists it's usually within seconds.
+- Spotify gets the whole plan as one queue and plays it by itself, so **you can lock your phone**. When you come back, the app catches up to wherever Spotify got to.
+- Turn on **Crossfade** in Spotify (Settings → Playback) and enter the same number of seconds in Playlist Plus → Settings. Every song change and phase change then fades smoothly, and the session stops cleanly at the end.
+- Trimmed songs are the exception: jumping to a trim point needs the app. Playlist Plus starts a song with a trimmed start right at its trim point (you don't hear the intro first), and sends trim-end skips early enough to make up for network delay. If the phone is locked, trimmed songs simply play in full.
+- Turn off **Autoplay** in Spotify if you lock your phone. Otherwise Spotify keeps playing similar songs after the session.
+
+**Exact** transitions are still there if you want phases to change on the dot, but on an iPhone that means a hard cut, and the app must stay open.
+
+If iOS closes the app in the background, the session isn't lost: reopening the app picks it up again (or offers to resume it).
+
 ### Use
 
 - **Timed session:** open the **Session** tab. Tap each phase's playlist to pick one from your library, and set its time (**Minutes**, **Percent** or **Rest**). Then tap the green play button. The list icon next to it previews the plan first. During the session the screen shows a big countdown, the phase timeline, the current song and controls, and stays awake.
@@ -41,11 +55,9 @@ Apple doesn't allow modifying the Spotify app on iPhone. So the phone version is
 
 ### Phone limitations (from iOS and Spotify, not fixable in the app)
 
-- **The app has to be open for trims and exact phase timing.** iOS pauses web apps that are in the background or when the screen locks. During a session the app keeps the screen on for this reason, so leave it open (a phone on an armband or a treadmill works fine).
-  - If you lock the phone anyway, Spotify keeps playing the planned songs in order, so the music still moves through warm-up, normal and cool-down. While the phone is locked, songs play untrimmed and phase changes happen at song boundaries. When you open the app again it catches up.
-  - Outside sessions, trims only apply while the app is open.
+- **Trims need the app open.** iOS pauses web apps in the background. Smooth sessions don't need the app at all, apart from trimmed songs; outside sessions, trims only apply while the app is open. During a session the app keeps the screen on.
 - **Only playlists you created or collaborate on can be used.** Since February 2026, Spotify doesn't let personal apps read other people's playlists, including Spotify's own. To use one, create a playlist and add its songs to it (select all, then **Add to playlist**).
-- **No fade-out on iPhone.** iPhones don't allow remote volume control, so cut songs stop without fading. Fades work when Spotify plays on a computer or speaker.
+- **No volume fades on iPhone.** iPhones don't allow remote volume control. Use Smooth transitions with Spotify's own crossfade instead (see above). Volume fades work when Spotify plays on a computer or speaker.
 - **Trims and templates are stored per device.** Use Export and Import to copy them across.
 
 ## Desktop (Windows, macOS, Linux)
@@ -78,6 +90,8 @@ Right-click a song and choose **Trim song…**. Drag the two handles on the time
 To see, edit, back up or import all your trims, open the **Playlist Plus** button (the clock icon in the top bar) and go to the **Trimmed songs** tab.
 
 #### Timed session
+The desktop app can fade the volume, so its default is **On time**: phases change exactly on the minute and the playing song fades out. Choose **Between songs** for the phone-style smooth mode.
+
 1. Click the **Playlist Plus** clock icon in the top bar.
 2. Set the session length, then give each phase a playlist (choose one from your library, or use the link button to paste one) and an amount of time:
    - **Min**: a fixed number of minutes.
