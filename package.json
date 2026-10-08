@@ -1,0 +1,8 @@
+{
+  "name": "spotify-mod",
+  "private": true,
+  "description": "Playlist Plus: a Spicetify extension that trims songs and plays timed multi-phase playlists.",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  }
+}
