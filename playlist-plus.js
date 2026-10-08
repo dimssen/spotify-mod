@@ -94,22 +94,25 @@ const PlaylistPlusCore = (() => {
 
   /**
    * Pick tracks from `tracks` until their (trimmed) length covers `budgetMs`.
-   * The last track usually runs past the budget; the runner cuts it at the boundary.
+   * The last track usually runs past the budget; it plays to its end.
    * smartFit: prefer tracks that still fit entirely in the remaining time, and avoid leaving
    * gaps so short that the phase would end with a few-second fragment of a song.
    * Tracks repeat (re-shuffled) only if the playlist is shorter than the budget.
    */
   const MIN_TAIL = 45000;
+  // Exact sessions: if less than this would be left of a phase after the current song, the
+  // phase ends with that song (starting another one would overrun by much more).
+  const EXACT_SLACK = 15000;
 
   function planPhase(tracks, budgetMs, opts = {}) {
-    const { shuffle = true, smartFit = true, rng = Math.random, trims = {}, prevUri = null } = opts;
+    const { shuffle = true, smartFit = true, rng = Math.random, trims = {}, prevUri = null, slack = 0 } = opts;
     const usable = tracks.filter((t) => t && t.uri && t.duration > 0);
     if (!usable.length || !(budgetMs > 0)) return [];
     const items = [];
     let acc = 0;
     let pool = [];
     let last = prevUri;
-    for (let guard = 0; acc < budgetMs && guard < 10000; guard++) {
+    for (let guard = 0; (items.length === 0 || acc < budgetMs - slack) && guard < 10000; guard++) {
       if (!pool.length) pool = shuffle ? shuffled(usable, rng) : usable.slice();
       const remaining = budgetMs - acc;
       const len = (t) => trackBounds(t, trims).length;
@@ -239,7 +242,8 @@ const PlaylistPlusCore = (() => {
    * Plan a whole session. phaseDefs: [{ name, color, pool, budget }].
    * mode "smooth": phases end between songs; any difference from a phase's target is
    * carried into the next phase so the session as a whole stays on time.
-   * mode "exact": phases end on the minute (the runner cuts the song that's playing).
+   * mode "exact": a phase ends when its time is up, after the song that's playing finishes;
+   * the overrun comes off the next phase.
    */
   function planSession(phaseDefs, opts = {}) {
     if (opts.mode !== "smooth" || opts.attempts === 1) return planSessionOnce(phaseDefs, opts);
@@ -273,6 +277,7 @@ const PlaylistPlusCore = (() => {
     const phases = [];
     let target = 0;
     let planned = 0;
+    let overrun = 0; // exact: how far the previous phase's last song runs past its time
     for (const def of phaseDefs) {
       target += def.budget;
       if (!(def.budget > 0)) continue;
@@ -286,13 +291,33 @@ const PlaylistPlusCore = (() => {
         items = planPhaseSmooth(def.pool, target - planned + shift, base);
         budget = items.reduce((a, i) => a + i.length, 0);
       } else {
-        items = planPhase(def.pool, def.budget, base);
+        // The last song always finishes and the overrun comes off this phase, so plan for that.
+        const want = Math.max(0, def.budget - overrun);
+        items = want > 0 ? planPhase(def.pool, want, { ...base, slack: EXACT_SLACK }) : [];
         budget = def.budget;
+        overrun = items.reduce((a, i) => a + i.length, 0) - want; // may be slightly negative (slack)
       }
       planned += budget;
       phases.push({ name: def.name, color: def.color, target: def.budget, budget, pool: def.pool, items });
     }
     return phases;
+  }
+
+  /**
+   * What to keep playing once a session is over: the rest of the last phase's playlist,
+   * songs not heard in the session first (shuffled if the session shuffles). Returned as
+   * URIs so they can be queued straight after the plan, and play even if the app is asleep.
+   */
+  function afterSessionQueue(phases, { shuffle = true, rng = Math.random, max = 80 } = {}) {
+    const last = phases[phases.length - 1];
+    if (!last || !last.pool) return [];
+    const played = new Set(phases.flatMap((p) => p.items.map((i) => i.uri)));
+    const pool = last.pool.filter((t) => t && t.uri && t.duration > 0);
+    const fresh = pool.filter((t) => !played.has(t.uri));
+    const again = pool.filter((t) => played.has(t.uri));
+    const order = shuffle ? [...shuffled(fresh, rng), ...shuffled(again, rng)] : [...fresh, ...again];
+    const lastUri = last.items.length ? last.items[last.items.length - 1].uri : null;
+    return order.map((t) => t.uri).filter((u) => u !== lastUri).slice(0, max);
   }
 
   /**
@@ -309,6 +334,8 @@ const PlaylistPlusCore = (() => {
    * a song except at trim points, and natural song changes are left to Spotify.
    * opts.crossfadeMs: the crossfade set in the user's Spotify app, so the session can stop
    * before Spotify starts fading into something unplanned.
+   * opts.after: { uris, playlistUri } to keep playing once the session is over (queued right
+   * after the plan); without it, playback pauses at the end.
    */
   class SessionRunner {
     constructor(player, phases, opts = {}) {
@@ -368,7 +395,7 @@ const PlaylistPlusCore = (() => {
         phaseIdx: this.phaseIdx,
         itemIdx: this.itemIdx,
         phaseElapsed: this.phaseElapsed,
-        opts: { fadeMs: this.opts.fadeMs, crossfadeMs: this.opts.crossfadeMs, smooth: this.opts.smooth, shuffle: this.opts.shuffle, smartFit: this.opts.smartFit },
+        opts: { fadeMs: this.opts.fadeMs, crossfadeMs: this.opts.crossfadeMs, smooth: this.opts.smooth, shuffle: this.opts.shuffle, smartFit: this.opts.smartFit, after: this.opts.after },
       };
     }
 
@@ -385,10 +412,15 @@ const PlaylistPlusCore = (() => {
 
     /** Time left in the current phase. Smooth sessions count the planned songs that remain. */
     phaseLeft() {
-      if (!this.opts.smooth) return Math.max(0, this.phase.budget - this.phaseElapsed);
       const p = this.player;
       const item = this.item;
       const pos = p.currentUri() === item.uri ? p.progress() : item.start;
+      if (!this.opts.smooth) {
+        // Once time is up, the phase still lasts until the playing song ends.
+        const left = this.phase.budget - this.phaseElapsed;
+        const songLeft = Math.max(0, item.end - Math.max(pos, item.start));
+        return left - songLeft < EXACT_SLACK ? songLeft : left;
+      }
       let left = Math.max(0, item.end - Math.max(pos, item.start));
       for (let i = this.itemIdx + 1; i < this.phase.items.length; i++) left += this.phase.items[i].length;
       return left;
@@ -407,6 +439,11 @@ const PlaylistPlusCore = (() => {
         totalLeft,
         item: this.item,
         next: this._peekNext(),
+        // The phase (or session) changes when the playing song ends.
+        changesAfterThisSong: (() => {
+          const plan = this._songEndPlan();
+          return plan.type === "finish" || plan.target.pi !== this.phaseIdx;
+        })(),
       };
     }
 
@@ -440,52 +477,107 @@ const PlaylistPlusCore = (() => {
       }
 
       if (!p.isPlaying()) return;
-
       this.phaseElapsed += dt;
-      const smooth = this.opts.smooth;
-      const phaseLeft = this.phase.budget - this.phaseElapsed;
-      if (!smooth && phaseLeft <= 0) {
-        this._nextPhase();
-        return;
-      }
 
       const item = this.item;
       const trackLeft = item.end - p.progress();
       const lead = this.lead;
-      const next = this._peekNext();
       const trimmedEnd = item.duration && item.end < item.duration - 500;
-      const lastSong = !next;
-      const xf = this.opts.crossfadeMs || 0;
-
-      // How long until we cut this song (trim end, or an exact phase boundary mid-song)?
-      let cutIn = Infinity;
-      if (trimmedEnd) cutIn = trackLeft;
-      if (!smooth && trackLeft > phaseLeft + 250) cutIn = Math.min(cutIn, phaseLeft);
       const fadeMs = this.opts.fadeMs;
-      if (fadeMs > 0 && cutIn < fadeMs) {
-        // Fade out before a cut (only on devices that allow volume control).
+      if (trimmedEnd && fadeMs > 0 && trackLeft < fadeMs + lead) {
+        // Fade out before cutting at a trim end (only on devices that allow volume control).
         if (this.baseVolume == null) this.baseVolume = p.getVolume();
-        if (this.baseVolume != null) p.setVolume(this.baseVolume * Math.max(0, (cutIn - lead) / fadeMs));
+        if (this.baseVolume != null) p.setVolume(this.baseVolume * Math.max(0, (trackLeft - lead) / fadeMs));
       }
 
-      if (lastSong && (smooth || trackLeft <= phaseLeft + 250)) {
-        // Stop right as the last song ends (before any crossfade into something unplanned).
-        if (trackLeft <= lead + xf) this._finish();
-        return;
+      // Songs are never cut at phase changes: what happens is decided at the end of each song.
+      const plan = this._songEndPlan();
+      if (plan.type === "natural" && !trimmedEnd) return; // Spotify moves on by itself (crossfade and all)
+      // Act at the trim point, or just before the song (and Spotify's crossfade) ends.
+      if (trackLeft > lead + (trimmedEnd ? 0 : this.opts.crossfadeMs || 0)) return;
+      if (plan.type === "finish" || !plan.target) return this._finish();
+      this._goTo(plan.target);
+    }
+
+    /**
+     * What should happen when the current song ends (or reaches its trim end):
+     * - smooth: the next planned song.
+     * - exact: the next song of this phase, or, once the phase's time is up, the first song
+     *   of the next phase (the playing song always finishes first).
+     * "natural" means Spotify's queue already has the right song next, so nothing to do.
+     */
+    _songEndPlan() {
+      let target;
+      if (this.opts.smooth) {
+        target = this._planNext();
+      } else {
+        const trackLeft = this.item.end - this.player.progress();
+        const timeUp = this.phase.budget - this.phaseElapsed - trackLeft < EXACT_SLACK;
+        if (timeUp) target = this._firstOfPhaseAfter(this.phaseIdx);
+        else if (this.itemIdx + 1 < this.phase.items.length) target = { pi: this.phaseIdx, i: this.itemIdx + 1 };
+        else target = { pi: this.phaseIdx, i: this.phase.items.length, extend: true };
       }
-      if (trimmedEnd && trackLeft <= lead) return this._advanceTrack();
-      // The next song starts at a trim point: hand over at the song boundary ourselves, so
-      // Spotify doesn't play the next song's intro first.
-      if (next && next.start > 0 && trackLeft <= lead + (trimmedEnd ? 0 : xf)) return this._advanceTrack();
-      // Adapters that don't queue the plan need us to start the next song.
-      if (!p.playsUpcoming && trackLeft <= lead) this._advanceTrack();
+      if (!target) {
+        // Session over. If the "keep playing" songs are queued next, Spotify just carries on.
+        const after = this._afterUris();
+        const natural = !!(this.player.playsUpcoming && after.length && this._queuedNextUri() === after[0]);
+        return { type: natural ? "natural" : "finish" };
+      }
+      const next = target.extend ? null : this.phases[target.pi].items[target.i];
+      const natural = !!(this.player.playsUpcoming && next && next.start === 0 && this._queuedNextUri() === next.uri);
+      return { type: natural ? "natural" : "handover", target, next };
+    }
+
+    _planNext() {
+      if (this.itemIdx + 1 < this.phase.items.length) return { pi: this.phaseIdx, i: this.itemIdx + 1 };
+      return this._firstOfPhaseAfter(this.phaseIdx);
+    }
+
+    _firstOfPhaseAfter(pi) {
+      for (let k = pi + 1; k < this.phases.length; k++) if (this.phases[k].items.length) return { pi: k, i: 0 };
+      return null;
+    }
+
+    /** The song Spotify will play next by itself (from the queue given with the last play()). */
+    _queuedNextUri() {
+      if (this.queue) return this.queue[this.queuePos + 1] || null;
+      const n = this._planNext(); // after a restore we don't know the queue; assume the plan
+      return n ? this.phases[n.pi].items[n.i].uri : this._afterUris()[0] || null;
+    }
+
+    _afterUris() {
+      return (this.opts.after && this.opts.after.uris) || [];
+    }
+
+    _goTo(target) {
+      if (target.extend) {
+        // Exact mode ran out of planned songs before the phase's time (songs were skipped).
+        const prev = this.phase.items[this.phase.items.length - 1];
+        const left = Math.max(1000, this.phase.budget - this.phaseElapsed);
+        const more = planPhase(this.phase.pool || [], left, { ...this.opts, prevUri: prev && prev.uri, slack: EXACT_SLACK });
+        if (!more.length) return this._nextPhase();
+        this.phase.items.push(...more);
+      }
+      if (target.pi !== this.phaseIdx) this._enterPhase(target.pi, target.i);
+      else this.itemIdx = target.i;
+      this._playItem();
+    }
+
+    /** Switch phase. Exact sessions take any overrun off the next phase so the session stays on time. */
+    _enterPhase(pi, i) {
+      // (Negative if the phase ended a few seconds early: the next phase gets them.)
+      const carry = !this.opts.smooth && pi === this.phaseIdx + 1 ? Math.max(-EXACT_SLACK, this.phaseElapsed - this.phase.budget) : 0;
+      this.phaseIdx = pi;
+      this.itemIdx = i;
+      this.phaseElapsed = carry;
+      this._emit("phase");
     }
 
     /**
      * How long until the runner next has to do something itself (cut at a trim end, hand
-     * over to a song with a trimmed start, a fade, an exact phase cut, stopping at the end).
-     * Natural song changes need no action; we just check in after the song. Lets the app
-     * sleep (poll less, redraw less) in between, to save battery.
+     * over to a song with a trimmed start or to a song Spotify won't play next by itself,
+     * a fade, stopping at the end). Natural song changes need no action; we just check in
+     * after the song. Lets the app sleep (poll less, redraw less) in between, to save battery.
      */
     msUntilAction() {
       if (!this.active) return Infinity;
@@ -495,27 +587,20 @@ const PlaylistPlusCore = (() => {
       const item = this.item;
       const trackLeft = item.end - p.progress();
       const lead = this.lead;
-      const xf = this.opts.crossfadeMs || 0;
-      const next = this._peekNext();
       const trimmedEnd = item.duration && item.end < item.duration - 500;
+      const plan = this._songEndPlan();
+      if (plan.type === "natural" && !trimmedEnd) return trackLeft + 1000; // catch up afterwards
       const canFade = this.opts.fadeMs > 0 && p.getVolume() != null;
-      let cut = trimmedEnd ? trackLeft : Infinity;
-      if (!this.opts.smooth) cut = Math.min(cut, this.phaseLeft());
-      let t = cut - lead - (canFade && cut < Infinity ? this.opts.fadeMs : 0);
-      if (!next) t = Math.min(t, trackLeft - lead - xf);
-      else if (next.start > 0) t = Math.min(t, trackLeft - lead - (trimmedEnd ? 0 : xf));
-      if (!p.playsUpcoming) t = Math.min(t, trackLeft - lead);
-      if (t === Infinity) t = trackLeft + 1000; // a natural song change: catch up afterwards
+      const t = trimmedEnd ? trackLeft - lead - (canFade ? this.opts.fadeMs : 0) : trackLeft - lead - (this.opts.crossfadeMs || 0);
       return Math.max(0, t);
     }
 
     /**
-     * Whether the rest of the session needs the app at all. A smooth session whose remaining
-     * songs have no trims plays entirely by itself in Spotify, so the phone can lock.
+     * Whether the rest of the session needs the app at all. Without trims, Spotify plays the
+     * planned queue in exactly the right order by itself, so the phone can lock.
      */
     needsApp() {
       if (!this.active) return false;
-      if (!this.opts.smooth) return true;
       for (let pi = this.phaseIdx; pi < this.phases.length; pi++) {
         const items = this.phases[pi].items;
         for (let i = pi === this.phaseIdx ? this.itemIdx : 0; i < items.length; i++) {
@@ -528,12 +613,8 @@ const PlaylistPlusCore = (() => {
     }
 
     _peekNext() {
-      const items = this.phase.items;
-      if (this.itemIdx + 1 < items.length) return items[this.itemIdx + 1];
-      // In exact mode the next phase starts by a cut, not by a song ending.
-      if (!this.opts.smooth) return null;
-      for (let pi = this.phaseIdx + 1; pi < this.phases.length; pi++) if (this.phases[pi].items.length) return this.phases[pi].items[0];
-      return null;
+      const n = this._planNext();
+      return n ? this.phases[n.pi].items[n.i] : null;
     }
 
     _findAhead(uri) {
@@ -549,13 +630,25 @@ const PlaylistPlusCore = (() => {
 
     _syncTo({ pi, i }, dt) {
       const phaseChanged = pi !== this.phaseIdx;
+      if (this.queue) {
+        const pos = this.queue.indexOf(this.phases[pi].items[i].uri, this.queuePos + 1);
+        if (pos >= 0) this.queuePos = pos;
+      }
+      const intoNextPhase = phaseChanged && pi === this.phaseIdx + 1 && i === 0 && dt < 5000;
+      const carry = !this.opts.smooth && intoNextPhase ? Math.max(-EXACT_SLACK, this.phaseElapsed - this.phase.budget) : 0;
       this.phaseIdx = pi;
       this.itemIdx = i;
       if (phaseChanged) {
-        // Estimate how far into this phase Spotify got from the planned songs before this one.
-        let est = 0;
-        for (let k = 0; k < i; k++) est += this.phase.items[k].length;
-        this.phaseElapsed = est + Math.max(0, this.player.progress() - this.item.start);
+        const played = Math.max(0, this.player.progress() - this.item.start);
+        if (intoNextPhase) {
+          // A normal song change into the next phase (exact: minus the previous phase's overrun).
+          this.phaseElapsed = carry + played;
+        } else {
+          // Spotify got further while we weren't running: estimate from the planned songs.
+          let est = 0;
+          for (let k = 0; k < i; k++) est += this.phase.items[k].length;
+          this.phaseElapsed = est + played;
+        }
         this._emit("phase");
       } else if (this.player.isPlaying()) {
         this.phaseElapsed += dt;
@@ -567,17 +660,19 @@ const PlaylistPlusCore = (() => {
       this._emit("track");
     }
 
-    /** URIs of the planned songs after the current one, for adapters that queue them. */
+    /** URIs of the planned songs after the current one (then the keep-playing songs), for adapters that queue them. */
     _upcoming() {
       const out = [];
       for (let pi = this.phaseIdx; pi < this.phases.length; pi++) {
         const items = this.phases[pi].items;
         for (let i = pi === this.phaseIdx ? this.itemIdx + 1 : 0; i < items.length && out.length < 99; i++) out.push(items[i].uri);
       }
+      for (const u of this._afterUris()) if (out.length < 99) out.push(u);
       return out;
     }
 
     _advanceTrack() {
+      if (!this.opts.smooth && this.phase.budget - this.phaseElapsed <= 0) return this._nextPhase();
       this.itemIdx++;
       if (this.itemIdx >= this.phase.items.length) {
         // Exact mode: ran out of planned songs (the user skipped some), so plan more for the
@@ -595,18 +690,12 @@ const PlaylistPlusCore = (() => {
     }
 
     _nextPhase() {
-      this.phaseIdx++;
-      this.itemIdx = 0;
-      this.phaseElapsed = 0;
-      if (this.phaseIdx >= this.phases.length) {
+      const next = this._firstOfPhaseAfter(this.phaseIdx);
+      if (!next) {
         this._finish();
         return;
       }
-      if (!this.phase.items.length) {
-        this._nextPhase();
-        return;
-      }
-      this._emit("phase");
+      this._enterPhase(next.pi, 0);
       this._playItem();
     }
 
@@ -615,13 +704,23 @@ const PlaylistPlusCore = (() => {
       this.expected = item.uri;
       this.switching = true;
       this.switchWait = 0;
-      this.player.play(item.uri, item.start, this._upcoming());
+      const upcoming = this._upcoming();
+      this.queue = [item.uri, ...upcoming];
+      this.queuePos = 0;
+      this.player.play(item.uri, item.start, upcoming);
       this._emit("track");
     }
 
     _finish() {
       this.active = false;
-      this.player.pause();
+      const after = this._afterUris();
+      if (!after.length) {
+        this.player.pause();
+      } else if (!after.includes(this.player.currentUri())) {
+        // Keep the music going with the last phase's playlist.
+        if (this.player.continuePlaylist && this.opts.after.playlistUri) this.player.continuePlaylist(this.opts.after.playlistUri, after[0]);
+        else this.player.play(after[0], 0, after.slice(1));
+      }
       this._restoreVolume();
       this._emit("finish");
     }
@@ -1019,7 +1118,7 @@ const PlaylistPlusCore = (() => {
   const PHASE_COLORS = ["#e13300", "#8d67ab", "#509bf5", "#e8115b", "#27856a", "#ba5d07", "#477d95", "#148a08"];
   const phaseColor = (i) => PHASE_COLORS[i % PHASE_COLORS.length];
 
-  return { parseTime, formatTime, normalizePlaylistUri, computeBudgets, trackBounds, shuffled, planPhase, SessionRunner, TrimWatcher, phaseColor, ICONS, planPhaseSmooth, planSession, mergeDocs, stableStringify, SyncStore, createGistClient, syncOnce, createSyncer };
+  return { parseTime, formatTime, normalizePlaylistUri, computeBudgets, trackBounds, shuffled, planPhase, SessionRunner, TrimWatcher, phaseColor, ICONS, planPhaseSmooth, planSession, afterSessionQueue, mergeDocs, stableStringify, SyncStore, createGistClient, syncOnce, createSyncer };
 })();
 
 if (typeof module !== "undefined" && module.exports) module.exports = PlaylistPlusCore;
@@ -1042,7 +1141,7 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
     Spicetify.Topbar;
   while (!ready()) await new Promise((r) => setTimeout(r, 300));
 
-  const { parseTime, formatTime, normalizePlaylistUri, computeBudgets, planSession, SessionRunner, TrimWatcher, phaseColor, ICONS, SyncStore, createGistClient, createSyncer } = PlaylistPlusCore;
+  const { parseTime, formatTime, normalizePlaylistUri, computeBudgets, planSession, afterSessionQueue, SessionRunner, TrimWatcher, phaseColor, ICONS, SyncStore, createGistClient, createSyncer } = PlaylistPlusCore;
 
   // ----- storage -----------------------------------------------------------
   const KEY = {
@@ -1065,7 +1164,7 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
   };
   const save = (k, v) => Spicetify.LocalStorage.set(k, JSON.stringify(v));
 
-  let settings = { trimsEnabled: true, trimsInSessions: true, fadeSeconds: 3, ...load(KEY.settings, {}) };
+  let settings = { trimsEnabled: true, trimsInSessions: true, fadeSeconds: 3, keepPlaying: true, ...load(KEY.settings, {}) };
   // The built-in template has a fixed id, so it's the same template on every synced device.
   const defaultTemplate = (id = "default-workout") => ({
     id,
@@ -1104,6 +1203,14 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
     getVolume: () => P.getVolume(),
     setVolume: (v) => P.setVolume(v),
     leadMs: 120,
+    // After a session: switch to the playlist itself, starting at a song not heard yet.
+    continuePlaylist: async (playlistUri, firstUri) => {
+      try {
+        await Spicetify.Platform.PlayerAPI.play({ uri: playlistUri }, {}, firstUri ? { skipTo: { uri: firstUri } } : {});
+      } catch {
+        P.playUri(playlistUri);
+      }
+    },
   };
 
   const notify = (msg, isError = false) => Spicetify.showNotification(msg, isError);
@@ -1570,8 +1677,8 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
           h("div", { className: "pp-grow" }),
           h("span", { className: "pp-muted" }, "Phase changes"),
           h("div", { className: "pp-seg" },
-            h("button", { className: smooth() ? "" : "on", title: "Exactly on time; the song playing fades out", onClick: () => ((tpl.transitions = "exact"), persist(), render()) }, "On time"),
-            h("button", { className: smooth() ? "on" : "", title: "Between songs, within seconds of the target; nothing gets cut", onClick: () => ((tpl.transitions = "smooth"), persist(), render()) }, "Between songs"),
+            h("button", { className: smooth() ? "" : "on", title: "When a phase's time is up, the next one starts after the song that's playing", onClick: () => ((tpl.transitions = "exact"), persist(), render()) }, "On time"),
+            h("button", { className: smooth() ? "on" : "", title: "Songs are picked so phases end within seconds of the target", onClick: () => ((tpl.transitions = "smooth"), persist(), render()) }, "Between songs"),
           ),
         ),
         timeline,
@@ -1613,6 +1720,10 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
       if (!defs.length) throw new Error("No phase has any time assigned.");
       const phases = planSession(defs, { mode: smooth() ? "smooth" : "exact", shuffle: tpl.shuffle, smartFit: tpl.smartFit, trims: settings.trimsInSessions ? trims : {} });
       phases.mode = smooth() ? "smooth" : "exact";
+      if (settings.keepPlaying) {
+        const lastPh = tpl.phases.filter((ph, i) => budgets[i] > 0).pop();
+        phases.after = { uris: afterSessionQueue(phases, { shuffle: tpl.shuffle }), playlistUri: lastPh && lastPh.playlistUri, name: phases[phases.length - 1].name };
+      }
       return phases;
     }
 
@@ -1627,24 +1738,22 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
           let t = 0;
           const rows = [];
           for (const it of ph.items) {
-            if (t >= ph.budget) break;
-            const plays = Math.min(it.length, ph.budget - t);
-            const cut = plays < it.length;
             rows.push(h("div", { className: "pp-item" },
               art(it.art, 40),
               h("div", { className: "pp-grow" },
                 h("div", { className: "t pp-ellipsis" }, it.name),
                 h("div", { className: "s pp-ellipsis" }, it.length < it.duration && h("span", { className: "pp-green" }, icon("scissors", 12)), it.artist),
               ),
-              h("div", { className: "e" + (cut ? " pp-green" : "") }, cut ? `${formatTime(plays)} ✂` : formatTime(plays)),
+              h("div", { className: "e" }, formatTime(it.length)),
             ));
             t += it.length;
           }
           return h("div", { style: "margin-top:12px" },
-            h("div", { className: "pp-legend", style: "margin:0 8px 4px" }, h("span", { style: `--c:${ph.color};color:#fff;font-size:14px` }, `${ph.name} · ${formatTime(ph.budget)}`)),
+            h("div", { className: "pp-legend", style: "margin:0 8px 4px" }, h("span", { style: `--c:${ph.color};color:#fff;font-size:14px` }, `${ph.name} · ${formatTime(t)}`)),
             h("div", { className: "pp-list" }, rows),
           );
         }),
+        phases.after && h("p", { className: "pp-muted", style: "margin:12px 8px" }, `Then keeps playing the ${phases.after.name} playlist.`),
       );
     }
 
@@ -1766,7 +1875,8 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
     return h("div", null,
       row("Trim songs while listening", "Apply your trims whenever a trimmed song plays.", toggle(settings.trimsEnabled, (v) => ((settings.trimsEnabled = v), saveSettings()))),
       row("Trim songs in timed sessions", null, toggle(settings.trimsInSessions, (v) => ((settings.trimsInSessions = v), saveSettings()))),
-      row("Fade out cut songs", "Seconds to fade when a phase ends mid-song.",
+      row("Keep playing after a session", "When the session ends, the music carries on with the last phase's playlist.", toggle(settings.keepPlaying, (v) => ((settings.keepPlaying = v), saveSettings()))),
+      row("Fade out trimmed songs", "Seconds to fade before a song's trimmed end.",
         h("input", { type: "number", min: "0", max: "15", value: settings.fadeSeconds, "aria-label": "Fade seconds", onChange: (e) => ((settings.fadeSeconds = Math.max(0, Math.min(15, Number(e.target.value) || 0))), saveSettings()) }),
       ),
       h("h3", null, "Sync"),
@@ -1868,11 +1978,12 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
     Spicetify.PopupModal.hide();
     runner = new SessionRunner(player, phases, {
       smooth: phases.mode === "smooth",
+      after: phases.after,
       fadeMs: settings.fadeSeconds * 1000,
       trims: settings.trimsInSessions ? trims : {},
       onEvent: (type, r) => {
         if (type === "phase") notify(`Now: ${r.phase.name}`);
-        if (type === "finish") notify("Session complete 🎉");
+        if (type === "finish") notify(r.opts.after ? `Session complete 🎉 Still playing ${r.opts.after.name}.` : "Session complete 🎉");
         w.key = null;
         renderWidget();
       },

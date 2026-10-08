@@ -41,15 +41,16 @@ iPhones don't let apps change Spotify's volume, and Spotify's crossfade only app
 - Spotify gets the whole plan as one queue and plays it by itself, so **you can lock your phone**. When you come back, the app catches up to wherever Spotify got to.
 - Turn on **Crossfade** in Spotify (Settings → Playback) and enter the same number of seconds in Playlist Plus → Settings. Every song change and phase change then fades smoothly, and the session stops cleanly at the end.
 - Trimmed songs are the exception: jumping to a trim point needs the app. Playlist Plus starts a song with a trimmed start right at its trim point (you don't hear the intro first), and sends trim-end skips early enough to make up for network delay. If the phone is locked, trimmed songs simply play in full.
-- Turn off **Autoplay** in Spotify if you lock your phone. Otherwise Spotify keeps playing similar songs after the session.
 
-**Exact** transitions are still there if you want phases to change on the dot, but on an iPhone that means a hard cut, and the app must stay open.
+**Exact** transitions never cut a song either: when a phase's time is up, the next phase starts right after the song that's playing finishes, and any overrun comes off the next phase so the session stays on time. Smooth usually lands closer to your timings; Exact simply follows the clock.
+
+**After the session** the music keeps going with the last phase's playlist (songs you didn't hear in the session first). Those songs are queued right after the session, so this works with the phone locked too. Turn it off in Settings → Keep playing after a session.
 
 ### Battery saver (on by default)
 
 - **The phone can lock when the app isn't needed.** In a Smooth session with no trimmed songs left, Spotify does everything itself, so the app stops keeping the screen on and your phone locks as usual. The session screen tells you when this is the case.
-- **Black screen when the app is needed.** If trims or Exact timing need the app, the screen turns pitch black after 20 seconds without a touch, showing only a dim phase and minutes-left line. On iPhones with OLED screens (iPhone X and later, except the XR and 11) black pixels are switched off, so this uses very little power. Tap to wake. You can also tap **Black screen** on the session screen.
-- **Quiet in between.** The app works out when it next has to act (a trim point, a hand-over, a cut) and checks Spotify only every 5 to 20 seconds until shortly before then, instead of every second.
+- **Black screen when the app is needed.** If trimmed songs need the app, the screen turns pitch black after 20 seconds without a touch, showing only a dim phase and minutes-left line. On iPhones with OLED screens (iPhone X and later, except the XR and 11) black pixels are switched off, so this uses very little power. Tap to wake. You can also tap **Black screen** on the session screen.
+- **Quiet in between.** The app works out when it next has to act (a trim point or a hand-over) and checks Spotify only every 5 to 20 seconds until shortly before then, instead of every second.
 
 Turn it off in Settings → Battery saver. Avoid iOS Low Power Mode during sessions where the app is needed: it forces the screen to lock after 30 seconds.
 
@@ -98,7 +99,7 @@ Right-click a song and choose **Trim song…**. Drag the two handles on the time
 To see, edit, back up or import all your trims, open the **Playlist Plus** button (the clock icon in the top bar) and go to the **Trimmed songs** tab.
 
 #### Timed session
-The desktop app can fade the volume, so its default is **On time**: phases change exactly on the minute and the playing song fades out. Choose **Between songs** for the phone-style smooth mode.
+Phase changes never cut a song. **On time** (the desktop default): when a phase's time is up, the next phase starts right after the song that's playing; any overrun comes off the next phase. **Between songs**: songs are picked so each phase ends within seconds of its target (the phone default).
 
 1. Click the **Playlist Plus** clock icon in the top bar.
 2. Set the session length, then give each phase a playlist (choose one from your library, or use the link button to paste one) and an amount of time:
@@ -111,7 +112,7 @@ While a session runs, a card above the player shows the current phase, a countdo
 
 Notes:
 - The session timer counts listening time only. It pauses when the music pauses.
-- **Smart fit** (the pulse icon) picks songs that finish before the phase ends when it can, so fewer songs get cut off, and it never ends a phase on a few-second scrap of a song. **Shuffle** (the shuffle icon) mixes each phase's playlist.
+- **Smart fit** (the pulse icon) picks songs that finish before the phase's time is up when it can, so phases don't run over by much. **Shuffle** (the shuffle icon) mixes each phase's playlist.
 - Trims apply inside sessions too. Settings lets you turn that off, change the fade length, or turn trims off entirely.
 - If you skip a song or start something else in Spotify, the session plays its next planned song. Press **Stop** to leave a session.
 - Sessions are saved as **templates**. Use **Duplicate** to make variants, for example a 30-minute version.

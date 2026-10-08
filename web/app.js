@@ -1,7 +1,7 @@
 // Playlist Plus for phones: controls the Spotify app on this phone (or any Spotify device)
 // through the Spotify Web API. Shares its playback logic with the desktop extension.
 (() => {
-  const { parseTime, formatTime, normalizePlaylistUri, computeBudgets, planSession, SessionRunner, TrimWatcher, phaseColor, SyncStore, createGistClient, createSyncer } = window.PlaylistPlusCore;
+  const { parseTime, formatTime, normalizePlaylistUri, computeBudgets, planSession, afterSessionQueue, SessionRunner, TrimWatcher, phaseColor, SyncStore, createGistClient, createSyncer } = window.PlaylistPlusCore;
 
   // ----- storage (same keys and formats as the desktop extension) -----------
   const KEY = {
@@ -34,7 +34,7 @@
     }
   };
 
-  let settings = { trimsEnabled: true, trimsInSessions: true, fadeSeconds: 3, crossfadeSeconds: 0, powerSaver: true, ...load(KEY.settings, {}) };
+  let settings = { trimsEnabled: true, trimsInSessions: true, fadeSeconds: 3, crossfadeSeconds: 0, powerSaver: true, keepPlaying: true, ...load(KEY.settings, {}) };
   // The built-in template has a fixed id, so it's the same template on every synced device.
   const defaultTemplate = (id = "default-workout") => ({
     id,
@@ -767,9 +767,9 @@
                 h("div", null, icon("check"), "Plays on its own: lock your phone any time"),
               )
             : h("div", { className: "feature-list" },
-                h("div", null, icon("timer"), "Phases change exactly on the minute"),
-                h("div", { className: "warn" }, icon("info"), "The song playing at a phase change gets cut (iPhones can't fade it)"),
-                h("div", { className: "warn" }, icon("info"), "Keep Playlist Plus open for the cuts to happen on time"),
+                h("div", null, icon("timer"), "A phase ends when its time is up, right after the song that's playing finishes"),
+                h("div", null, icon("check"), "No song gets cut; any overrun comes off the next phase, so the session stays on time"),
+                h("div", null, icon("check"), "Plays on its own: lock your phone any time"),
               ),
         ),
 
@@ -886,6 +886,11 @@
       });
       phases.mode = smooth() ? "smooth" : "exact";
       phases.title = tpl.name;
+      // When the session is over, keep playing the last phase's playlist.
+      if (settings.keepPlaying) {
+        const lastPh = tpl.phases.filter((ph, i) => budgets[i] > 0).pop();
+        phases.after = { uris: afterSessionQueue(phases, { shuffle: tpl.shuffle }), playlistUri: lastPh && lastPh.playlistUri, name: phases[phases.length - 1].name };
+      }
       return phases;
     }
 
@@ -906,31 +911,26 @@
     }
 
     function showPlan(phases) {
-      const total = phases.reduce((a, p) => a + p.budget, 0);
+      const total = phases.reduce((a, p) => a + p.items.reduce((b, i) => b + i.length, 0), 0);
       const trimmed = phases.reduce((a, p) => a + p.items.filter((i) => i.length < i.duration).length, 0);
       const note = (ic, text, cls = "") => h("div", { className: `note ${cls}` }, icon(ic), h("div", null, text));
       const close = openSheet(h("div", null,
         h("h3", null, `${tpl.name} · ${formatTime(total)}`),
-        smooth()
-          ? trimmed
-            ? note("scissors", `${trimmed} trimmed song${trimmed === 1 ? "" : "s"}: keep Playlist Plus open so they're trimmed. If your phone locks, they play in full and the session carries on.`)
-            : note("check", "Every change happens between songs, so Spotify plays this on its own. Lock your phone any time.", "good")
-          : note("info", "Exact timing cuts songs at phase changes. Keep Playlist Plus open during the session."),
-        smooth() && !settings.crossfadeSeconds && note("info", "Tip: turn on Crossfade in Spotify (Settings → Playback), then set the same value in Playlist Plus Settings, for seamless fades between songs."),
+        trimmed
+          ? note("scissors", `${trimmed} trimmed song${trimmed === 1 ? "" : "s"}: keep Playlist Plus open so they're trimmed. If your phone locks, they play in full and the session carries on.`)
+          : note("check", "Every change happens between songs, so Spotify plays this on its own. Lock your phone any time.", "good"),
+        !settings.crossfadeSeconds && note("info", "Tip: turn on Crossfade in Spotify (Settings → Playback), then set the same value in Playlist Plus Settings, for seamless fades between songs."),
         phases.map((ph) => {
           let t = 0;
           const rows = [];
           for (const it of ph.items) {
-            if (t >= ph.budget) break;
-            const plays = Math.min(it.length, ph.budget - t);
-            const cut = plays < it.length;
             rows.push(h("div", { className: "item" },
               art(it.art, 44),
               h("div", { className: "grow" },
                 h("div", { className: "t ellipsis" }, it.name),
                 h("div", { className: "s ellipsis" }, it.length < it.duration && h("span", { className: "green" }, icon("scissors")), it.artist),
               ),
-              h("div", { className: "end tnum" + (cut ? " green" : "") }, cut ? `${formatTime(plays)} ✂` : formatTime(plays)),
+              h("div", { className: "end tnum" }, formatTime(it.length)),
             ));
             t += it.length;
           }
@@ -938,11 +938,12 @@
             h("div", { className: "row", style: `--c:${ph.color}` },
               h("span", { style: `width:10px;height:10px;border-radius:50%;background:${ph.color}` }),
               h("b", { className: "grow" }, ph.name),
-              h("span", { className: "sub tnum" }, formatTime(ph.budget), smooth() && Math.abs(ph.budget - ph.target) >= 1000 ? h("span", { className: "tiny" }, ` (${ph.budget > ph.target ? "+" : "−"}${formatTime(Math.abs(ph.budget - ph.target))})`) : null),
+              h("span", { className: "sub tnum" }, formatTime(t), Math.abs(t - ph.target) >= 1000 ? h("span", { className: "tiny" }, ` (${t > ph.target ? "+" : "−"}${formatTime(Math.abs(t - ph.target))})`) : null),
             ),
             h("div", { className: "list" }, rows),
           );
         }),
+        phases.after && h("p", { className: "sub", style: "text-align:center" }, `Then keeps playing the ${phases.after.name} playlist.`),
         h("div", { style: "position:sticky;bottom:calc(-20px - var(--safe-b));margin:0 -16px calc(-20px - var(--safe-b));padding:28px 16px calc(20px + var(--safe-b));background:linear-gradient(rgba(36,36,36,0),#242424 40%)" },
           h("button", { className: "btn block", onClick: () => (close(), startSession(phases)) }, icon("play"), "Start this plan"),
         ),
@@ -1081,8 +1082,7 @@
     }
     if (r.nextLabel) {
       const np = runner.phases[st.phaseIdx + 1];
-      const lastSong = runner.opts.smooth && runner.itemIdx === runner.phase.items.length - 1;
-      r.nextLabel.textContent = lastSong ? `${np.name} starts after this song` : `Next: ${np.name} in ${formatTime(st.phaseLeft)}`;
+      r.nextLabel.textContent = st.changesAfterThisSong ? `${np.name} starts after this song` : `Next: ${np.name} in ${formatTime(st.phaseLeft)}`;
     }
     runner.phases.forEach((p, i) => {
       const pct = i < st.phaseIdx ? 100 : i > st.phaseIdx ? 0 : Math.min(100, ((p.budget - st.phaseLeft) / p.budget) * 100);
@@ -1397,6 +1397,7 @@
       h("h2", null, "Playback"),
       switchSetting("trimsEnabled", "Trim songs while listening", "Applies your trims whenever this app is open."),
       switchSetting("trimsInSessions", "Trim songs in timed sessions", null),
+      switchSetting("keepPlaying", "Keep playing after a session", "When the session ends, the music carries on with the last phase's playlist instead of stopping."),
       switchSetting("powerSaver", "Battery saver", "During sessions: the screen goes black after 20 s without a touch (tap to wake), Spotify is checked only when something's about to happen, and the phone may lock when the app has nothing left to do."),
       setting("Crossfade in Spotify", "Set the same value as Spotify → Settings → Playback → Crossfade. Sessions then end cleanly, and trimmed songs hand over at the right moment.",
         h("div", { className: "stepper" },
@@ -1406,7 +1407,7 @@
           h("button", { "aria-label": "Longer", onClick: () => ((settings.crossfadeSeconds = Math.min(12, settings.crossfadeSeconds + 1)), saveSettings(), (xfIn.value = settings.crossfadeSeconds)) }, icon("plus")),
         ),
       ),
-      setting("Fade out cut songs", "Volume fade before a trim end or an exact phase change. Works when Spotify plays on a computer or speaker; iPhones don't allow it, so use Smooth transitions there.",
+      setting("Fade out cut songs", "Volume fade before a trim end. Works when Spotify plays on a computer or speaker; iPhones don't allow it.",
         h("div", { className: "stepper" },
           h("button", { "aria-label": "Shorter", onClick: fadeStep(-1) }, icon("minus")),
           fadeIn,
@@ -1550,7 +1551,7 @@
       if (type === "phase") toast(`Now: ${r.phase.name}`);
       if (type === "finish") {
         exitPocket();
-        toast("Session complete 🎉");
+        toast(r.opts.after ? `Session complete 🎉 Still playing ${r.opts.after.name || "the last playlist"}.` : "Session complete 🎉");
         clearSession();
         if (wakeLock) wakeLock.release();
         if (tab === "session") renderTab();
@@ -1653,7 +1654,7 @@
   async function startSession(phases) {
     if (!(await ensureDevice())) return;
     if (runner) runner.stop();
-    runner = new SessionRunner(player, phases, runnerOpts({ smooth: phases.mode === "smooth" }));
+    runner = new SessionRunner(player, phases, runnerOpts({ smooth: phases.mode === "smooth", after: phases.after }));
     sessionTitle = phases.title || "";
     lastTick = Date.now();
     runner.start();

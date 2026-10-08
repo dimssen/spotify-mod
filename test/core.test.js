@@ -116,24 +116,26 @@ function simulate(runner, player, ms, step = 200) {
   }
 }
 
-test("SessionRunner plays phases for their budgets and stops at the end", () => {
+test("exact session: phases change after the playing song, never mid-song", () => {
   const warm = [track(1, 120), track(2, 150)];
   const normal = [track(3, 200), track(4, 210), track(5, 190)];
   const cool = [track(6, 100)];
   const durations = Object.fromEntries([...warm, ...normal, ...cool].map((t) => [t.uri, t.duration]));
-  const p = fakePlayer(durations);
-  const budgets = computeBudgets(20 * MIN, [
-    { mode: "minutes", value: 3 },
-    { mode: "minutes", value: 12 },
-    { mode: "rest" },
-  ]);
-  const pools = [warm, normal, cool];
-  const phases = pools.map((pool, i) => ({ name: `P${i}`, budget: budgets[i], pool, items: planPhase(pool, budgets[i], { shuffle: false }) }));
+  const p = fakePlayer(durations); // desktop-style player: the runner starts every song
+  const switches = [];
+  const play = p.play.bind(p);
+  p.play = (uri, start, up) => {
+    if (p.uri) switches.push({ from: p.uri, at: p.pos });
+    play(uri, start, up);
+  };
+  const budgets = computeBudgets(20 * MIN, [{ mode: "minutes", value: 3 }, { mode: "minutes", value: 12 }, { mode: "rest" }]);
+  const phases = planSession(
+    [warm, normal, cool].map((pool, i) => ({ name: `P${i}`, pool, budget: budgets[i] })),
+    { mode: "exact", shuffle: false },
+  );
   const events = [];
-  const r = new SessionRunner(p, phases, { fadeMs: 3000, onEvent: (type, rr) => events.push([type, rr.phaseIdx]) });
+  const r = new SessionRunner(p, phases, { onEvent: (type, rr) => events.push([type, rr.phaseIdx]) });
   r.start();
-
-  // Track which phase each played URI belonged to, and when.
   let t = 0;
   const firstSeen = {};
   while (r.active && t < 30 * MIN) {
@@ -144,14 +146,28 @@ test("SessionRunner plays phases for their budgets and stops at the end", () => 
   }
   assert.equal(r.active, false);
   assert.equal(p.playing, false);
-  // Session length ≈ 20 min (only playing time counts; small slack for track switches).
-  assert.ok(Math.abs(t - 20 * MIN) < 10000, `ended at ${t}`);
-  assert.ok(Math.abs(firstSeen[1] - 3 * MIN) < 5000, `phase 2 at ${firstSeen[1]}`);
-  assert.ok(Math.abs(firstSeen[2] - 15 * MIN) < 8000, `phase 3 at ${firstSeen[2]}`);
+  for (const sw of switches) assert.ok(sw.at >= durations[sw.from] - 700, `${sw.from} was cut at ${sw.at}`);
+  // Phase 2 starts after warm-up's time (3:00), at the end of the song playing then.
+  assert.ok(firstSeen[1] >= 3 * MIN - 1000 && firstSeen[1] <= 3 * MIN + 150000, `phase 2 at ${firstSeen[1]}`);
+  // The overrun comes off later phases, so the session ends near 20 min (at most one song late).
+  assert.ok(t >= 20 * MIN - 2000 && t <= 20 * MIN + 100000, `ended at ${t}`);
   assert.deepEqual(events.filter((e) => e[0] !== "track").map((e) => e[0]), ["phase", "phase", "finish"]);
-  assert.equal(p.volume, 1, "volume restored after fade");
-  // Cool-down only ever plays cool-down tracks.
-  assert.ok(phases[2].items.every((i) => i.uri === "spotify:track:t6"));
+});
+
+test("exact session on a phone plays entirely from Spotify's queue", () => {
+  const a = [track(1, 100), track(2, 130)];
+  const b = [track(3, 170), track(4, 160)];
+  const p = queueingPlayer(Object.fromEntries([...a, ...b].map((t) => [t.uri, t.duration])));
+  const phases = planSession([{ name: "A", pool: a, budget: 3 * MIN }, { name: "B", pool: b, budget: 5 * MIN }], { mode: "exact", shuffle: false });
+  const r = new SessionRunner(p, phases, {});
+  const events = [];
+  r.opts.onEvent = (type, rr) => events.push([type, rr.phaseIdx]);
+  r.start();
+  assert.equal(r.needsApp(), false, "no trims: nothing for the app to do");
+  simulate(r, p, 12 * MIN);
+  assert.equal(r.active, false);
+  assert.equal(p.log.length, 1, "one play() call: every change was Spotify moving on by itself");
+  assert.deepEqual(events.filter((e) => e[0] !== "track").map((e) => e[0]), ["phase", "finish"]);
 });
 
 test("SessionRunner applies trims and treats a manual skip as next song", () => {
@@ -171,16 +187,16 @@ test("SessionRunner applies trims and treats a manual skip as next song", () => 
 });
 
 test("SessionRunner does not count paused time", () => {
-  const tracks = [track(1, 600)];
-  const p = fakePlayer({ "spotify:track:t1": 600000 });
-  const r = new SessionRunner(p, [{ name: "A", budget: MIN, pool: tracks, items: planPhase(tracks, MIN) }]);
+  const tracks = [track(1, 30), track(2, 30)];
+  const p = fakePlayer({ "spotify:track:t1": 30000, "spotify:track:t2": 30000 });
+  const r = new SessionRunner(p, [{ name: "A", budget: MIN, pool: tracks, items: planPhase(tracks, MIN, { shuffle: false }) }]);
   r.start();
-  simulate(r, p, 30000);
+  simulate(r, p, 20000);
   p.pause();
   simulate(r, p, 5 * MIN);
-  assert.equal(r.active, true);
+  assert.equal(r.active, true, "paused time doesn't use up the session");
   p.playing = true;
-  simulate(r, p, 31000);
+  simulate(r, p, 45000);
   assert.equal(r.active, false);
 });
 
@@ -499,13 +515,48 @@ test("msUntilAction: sleeps through natural song changes, wakes before trims and
   simulate(r2, p2, 61000); // past the trim
   assert.equal(r2.needsApp(), false, "no trims left: the app can rest");
 
-  // Exact mode always needs the app; the phase cut is the next action.
+  // Exact mode no longer cuts: a 10-minute song in a 1-minute phase plays to its end,
+  // and the only action is stopping the session then.
   const p3 = queueingPlayer({ "spotify:track:t9": 600000 });
   p3.leadMs = 300;
   const t9 = [track(9, 600)];
   const r3 = new SessionRunner(p3, [{ name: "A", budget: MIN, pool: t9, items: planPhase(t9, MIN) }], {});
   r3.start();
   r3.tick(200);
-  assert.ok(r3.msUntilAction() < MIN && r3.msUntilAction() > MIN - 5000, `exact cut: ${r3.msUntilAction()}`);
-  assert.equal(r3.needsApp(), true);
+  assert.ok(Math.abs(r3.msUntilAction() - (600000 - 300)) < 1000, `finish at song end: ${r3.msUntilAction()}`);
+  assert.equal(r3.needsApp(), false);
+});
+
+// --- keep playing after the session --------------------------------------------------------
+const { afterSessionQueue } = core;
+
+test("after the session, Spotify carries on with the last playlist (no stop, no cut)", () => {
+  const a = [track(1, 100), track(2, 130)];
+  const b = [track(3, 170), track(4, 160), track(5, 150), track(6, 140)];
+  const p = queueingPlayer(Object.fromEntries([...a, ...b].map((t) => [t.uri, t.duration])));
+  const phases = planSession([{ name: "A", pool: a, budget: 3 * MIN }, { name: "B", pool: b, budget: 5 * MIN }], { mode: "exact", shuffle: false });
+  const uris = afterSessionQueue(phases, { shuffle: false });
+  const planned = new Set(phases.flatMap((ph) => ph.items.map((i) => i.uri)));
+  assert.ok(uris.length && !planned.has(uris[0]), "unheard songs of the last playlist come first");
+  const r = new SessionRunner(p, phases, { after: { uris, playlistUri: "spotify:playlist:b" } });
+  const events = [];
+  r.opts.onEvent = (type) => events.push(type);
+  r.start();
+  assert.deepEqual(p.queue.slice(-uris.length), uris, "queued right after the plan");
+  simulate(r, p, 12 * MIN);
+  assert.equal(r.active, false);
+  assert.ok(events.includes("finish"));
+  assert.equal(p.playing, true, "still playing");
+  assert.ok(uris.includes(p.uri), `now playing ${p.uri} from the last playlist`);
+  assert.equal(p.log.length, 1, "Spotify flowed into it by itself");
+});
+
+test("without keep-playing, the session pauses at the end", () => {
+  const a = [track(1, 100)];
+  const p = queueingPlayer({ "spotify:track:t1": 100000 });
+  const r = new SessionRunner(p, planSession([{ name: "A", pool: a, budget: MIN }], { mode: "smooth", shuffle: false }), { smooth: true });
+  r.start();
+  simulate(r, p, 3 * MIN);
+  assert.equal(r.active, false);
+  assert.equal(p.playing, false);
 });
