@@ -53,8 +53,34 @@ test("planPhase covers the budget and respects trims", () => {
 
 test("planPhase smart fit prefers songs that fit", () => {
   const tracks = [track(1, 300), track(2, 100)];
-  const items = planPhase(tracks, 120000, { shuffle: false, smartFit: true });
+  const items = planPhase(tracks, 200000, { shuffle: false, smartFit: true });
   assert.equal(items[0].uri, "spotify:track:t2");
+});
+
+test("planPhase smart fit avoids ending a phase on a few-second fragment", () => {
+  // 280s would leave a 20s gap; 200s + 100s fills 300s exactly.
+  const tracks = [track(1, 280), track(2, 200), track(3, 100)];
+  const items = planPhase(tracks, 300000, { shuffle: false, smartFit: true });
+  assert.deepEqual(items.map((i) => i.uri), ["spotify:track:t2", "spotify:track:t3"]);
+  // When nothing fits cleanly, cut a song near its end instead of adding a 20s fragment.
+  // 270s would leave 30s for a fragment; instead play the 400s song and cut it at 5:00.
+  const items2 = planPhase([track(1, 270), track(2, 400)], 300000, { shuffle: false, smartFit: true });
+  assert.deepEqual(items2.map((i) => i.uri), ["spotify:track:t2"]);
+});
+
+test("planPhase smart fit looks ahead so no phase ends on a scrap", () => {
+  // Four warm-up songs (2:30, 3:04, 2:47, 3:21) into 6:00, in every starting order.
+  const base = [track(1, 150), track(2, 184), track(3, 167), track(4, 201)];
+  for (let r = 0; r < base.length; r++) {
+    const tracks = base.slice(r).concat(base.slice(0, r));
+    const items = planPhase(tracks, 6 * MIN, { shuffle: false, smartFit: true });
+    let t = 0;
+    for (const it of items) {
+      const plays = Math.min(it.length, 6 * MIN - t);
+      assert.ok(plays >= 45000, `order ${r}: ${it.uri} would play only ${plays / 1000}s`);
+      t += it.length;
+    }
+  }
 });
 
 // --- simulated Spotify player -----------------------------------------------

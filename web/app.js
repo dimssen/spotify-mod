@@ -1,7 +1,7 @@
 // Playlist Plus for phones: controls the Spotify app on this phone (or any Spotify device)
 // through the Spotify Web API. Shares its playback logic with the desktop extension.
 (() => {
-  const { parseTime, formatTime, normalizePlaylistUri, computeBudgets, planPhase, SessionRunner, TrimWatcher } = window.PlaylistPlusCore;
+  const { parseTime, formatTime, normalizePlaylistUri, computeBudgets, planPhase, SessionRunner, TrimWatcher, phaseColor } = window.PlaylistPlusCore;
 
   // ----- storage (same keys and formats as the desktop extension) -----------
   const KEY = {
@@ -158,6 +158,11 @@
     return out;
   }
 
+  // Spotify lists images largest first.
+  const bigArt = (images) => (images && images.length ? images[0].url : null);
+  const smallArt = (images) => (images && images.length ? (images.find((i) => i.width && i.width <= 300) || images[images.length - 1]).url : null);
+  const trackArt = (t) => smallArt((t.album && t.album.images) || t.images);
+
   let me = null;
   let playlistsCache = null;
   async function listPlaylists(force) {
@@ -167,7 +172,14 @@
     // Spotify only lets apps read the songs of playlists you own or collaborate on.
     playlistsCache = all
       .filter(Boolean)
-      .map((p) => ({ uri: p.uri, id: p.id, name: p.name, readable: p.collaborative || (p.owner && p.owner.id === me.id) }));
+      .map((p) => ({
+        uri: p.uri,
+        id: p.id,
+        name: p.name,
+        art: smallArt(p.images),
+        total: (p.items && p.items.total) ?? (p.tracks && p.tracks.total) ?? null,
+        readable: p.collaborative || (p.owner && p.owner.id === me.id),
+      }));
     return playlistsCache;
   }
 
@@ -186,7 +198,7 @@
     const tracks = rows
       .map((r) => r.item || r.track)
       .filter((t) => t && isPlayableUri(t.uri) && !t.is_local && t.duration_ms > 0)
-      .map((t) => ({ uri: t.uri, name: t.name, artist: (t.artists || []).map((a) => a.name).join(", "), duration: t.duration_ms }));
+      .map((t) => ({ uri: t.uri, name: t.name, artist: (t.artists || []).map((a) => a.name).join(", "), duration: t.duration_ms, art: trackArt(t) }));
     trackCache[uri] = tracks;
     return tracks;
   }
@@ -233,6 +245,8 @@
                   name: d.item.name,
                   artist: (d.item.artists || []).map((a) => a.name).join(", "),
                   duration: d.item.duration_ms,
+                  art: trackArt(d.item),
+                  bigArt: bigArt((d.item.album && d.item.album.images) || d.item.images),
                   progress: d.progress_ms || 0,
                   playing: d.is_playing,
                   device: d.device,
@@ -279,6 +293,14 @@
       if (this.state) this.state.playing = false;
       this.command("PUT", `/me/player/pause${this.deviceQuery()}`);
     },
+    togglePlay() {
+      if (this.isPlaying()) return this.pause();
+      if (this.state) {
+        this.state.playing = true;
+        this.fetchedAt = Date.now();
+      }
+      this.command("PUT", `/me/player/play${this.deviceQuery()}`);
+    },
     // iPhones don't allow remote volume control, so fades only work on devices that do.
     getVolume() {
       const d = this.state && this.state.device;
@@ -293,6 +315,24 @@
       }, 400);
     },
   };
+
+  async function getTrack(uri) {
+    const [, type, id] = uri.split(":");
+    const t = await api("GET", `/${type === "episode" ? "episodes" : "tracks"}/${id}`);
+    return { uri, name: t.name, artist: (t.artists || []).map((a) => a.name).join(", "), duration: t.duration_ms, art: trackArt(t) };
+  }
+
+  const playlistMeta = {};
+  async function getPlaylistMeta(uri) {
+    const cached = (playlistsCache || []).find((p) => p.uri === uri);
+    if (cached) return cached;
+    if (!playlistMeta[uri]) {
+      playlistMeta[uri] = api("GET", `/playlists/${uri.split(":").pop()}?fields=name,images`)
+        .then((p) => ({ uri, name: p.name, art: smallArt(p.images) }))
+        .catch(() => ({ uri, name: "Pasted playlist", art: null }));
+    }
+    return playlistMeta[uri];
+  }
 
   // ----- DOM helpers -----------------------------------------------------------
   const toNodes = (children) => children.flat(Infinity).filter((c) => c != null && c !== false).map((c) => (c instanceof Node ? c : String(c)));
@@ -311,243 +351,452 @@
   }
   const fill = (el, ...children) => el.replaceChildren(...toNodes(children));
 
+  const { ICONS } = window.PlaylistPlusCore;
+  function icon(name) {
+    const d = ICONS[name];
+    const filled = typeof d === "object";
+    const wrap = document.createElement("div");
+    wrap.innerHTML = filled
+      ? `<svg class="i" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">${d.fill}</svg>`
+      : `<svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+    return wrap.firstChild;
+  }
+
+  function art(url, size, extra = {}) {
+    const el = h("div", { className: "art" + (extra.className ? " " + extra.className : ""), style: size ? `width:${size}px;height:${size}px` : null }, url ? null : icon("note"));
+    if (url) el.style.backgroundImage = `url("${url.replace(/"/g, "%22")}")`;
+    return el;
+  }
+
+  const setHero = (color) => document.documentElement.style.setProperty("--hero", color);
+  const setMini = (color) => document.documentElement.style.setProperty("--mini", color);
+
+  function toggle(checked, onChange) {
+    return h("label", { className: "switch" }, h("input", { type: "checkbox", checked, onChange: (e) => onChange(e.target.checked) }), h("span"));
+  }
+
   let toastEl = null;
   function toast(msg, isError) {
     if (!toastEl) {
-      toastEl = h("div", { style: "position:fixed;left:16px;right:16px;bottom:calc(16px + env(safe-area-inset-bottom));z-index:10;padding:12px 14px;border-radius:10px;font-size:15px;box-shadow:0 4px 16px #0008;display:none" });
+      toastEl = h("div", { id: "toast", role: "status" });
       document.body.append(toastEl);
     }
     toastEl.textContent = msg;
-    toastEl.style.background = isError ? "#5c1d24" : "#2a2a2a";
-    toastEl.style.display = "";
+    toastEl.className = isError ? "error" : "";
+    requestAnimationFrame(() => toastEl.classList.add("show"));
     clearTimeout(toast.t);
-    toast.t = setTimeout(() => (toastEl.style.display = "none"), 4000);
+    toast.t = setTimeout(() => toastEl.classList.remove("show"), 3200);
+  }
+
+  // Bottom sheet. Returns a close() function.
+  function openSheet(content, { onClose } = {}) {
+    const backdrop = h("div", { className: "sheet-backdrop" });
+    const sheet = h("div", { className: "sheet", role: "dialog" }, h("div", { className: "sheet-handle" }), content);
+    const wrap = h("div", { className: "sheet-wrap" }, backdrop, sheet);
+    document.body.append(wrap);
+    document.body.classList.add("locked");
+    requestAnimationFrame(() => requestAnimationFrame(() => wrap.classList.add("open")));
+    let closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      wrap.classList.remove("open");
+      setTimeout(() => {
+        wrap.remove();
+        if (!document.querySelector(".sheet-wrap")) document.body.classList.remove("locked");
+      }, 300);
+      if (onClose) onClose();
+    };
+    backdrop.addEventListener("click", close);
+    return close;
+  }
+
+  function actionSheet(title, actions) {
+    const close = openSheet(h("div", null,
+      title && h("h3", null, title),
+      actions.filter(Boolean).map((a) =>
+        h("button", { className: "action" + (a.danger ? " danger" : ""), onClick: () => (close(), a.run()) }, icon(a.icon), a.label),
+      ),
+    ));
+  }
+
+  function promptSheet(title, value, okLabel = "Save") {
+    return new Promise((resolve) => {
+      const input = h("input", { className: "field", value, autocomplete: "off" });
+      let result = null;
+      const close = openSheet(h("div", null,
+        h("h3", null, title),
+        input,
+        h("div", { className: "spacer" }),
+        h("button", { className: "btn block", onClick: () => {
+          result = input.value.trim() || null;
+          close();
+        } }, okLabel),
+      ), { onClose: () => resolve(result) });
+      setTimeout(() => input.focus(), 320);
+    });
+  }
+
+  function confirmSheet(title, message, okLabel) {
+    return new Promise((resolve) => {
+      let ok = false;
+      const close = openSheet(h("div", null,
+        h("h3", null, title),
+        message && h("p", { className: "sub" }, message),
+        h("div", { className: "spacer" }),
+        h("button", { className: "btn block", onClick: () => ((ok = true), close()) }, okLabel),
+        h("div", { className: "spacer" }),
+        h("button", { className: "btn outline block", onClick: () => close() }, "Cancel"),
+      ), { onClose: () => resolve(ok) });
+    });
   }
 
   // ----- screens ---------------------------------------------------------------
   const app = document.getElementById("app");
   let tab = "session";
   let fatal = null;
-  const nowPlayingBox = h("div");
-  const sessionBox = h("div");
-  const tabBox = h("div");
+  const main = h("main", { id: "main" });
+  const mini = h("div", { id: "mini" });
+  const nav = h("nav");
+  const dock = h("div", { id: "dock" }, mini, nav);
+  const TABS = [
+    ["session", "Session", "timer"],
+    ["trims", "Trims", "scissors"],
+    ["settings", "Settings", "sliders"],
+  ];
 
   function render() {
-    if (!clientId) return fill(app, setupScreen());
-    if (!auth) return fill(app, loginScreen());
-    fill(
-      app,
-      h("h1", null, "Playlist Plus"),
-      nowPlayingBox,
-      sessionBox,
-      h("div", { className: "tabs" },
-        [["session", "Session"], ["trims", "Trims"], ["settings", "Settings"]].map(([id, label]) =>
-          h("button", { className: tab === id ? "on" : "", onClick: () => ((tab = id), render()) }, label),
-        ),
-      ),
-      tabBox,
-    );
+    if (!clientId) {
+      setHero("#1e3264");
+      return fill(app, setupScreen());
+    }
+    if (!auth) {
+      setHero("#1e3264");
+      return fill(app, loginScreen());
+    }
+    fill(nav, TABS.map(([id, label, ic]) =>
+      h("button", { className: tab === id ? "on" : "", onClick: () => {
+        if (tab === id) return window.scrollTo({ top: 0, behavior: "smooth" });
+        tab = id;
+        render();
+        window.scrollTo({ top: 0 });
+      } }, icon(ic), label),
+    ));
+    fill(app, main, dock);
+    renderTab();
+  }
+
+  function renderTab() {
+    live.key = null;
+    fill(main, tab === "session" ? sessionTab() : tab === "trims" ? trimsTab() : settingsTab());
+    main.style.animation = "none";
+    void main.offsetWidth;
+    main.style.animation = "";
     updateLive();
-    fill(tabBox, tab === "session" ? sessionTab() : tab === "trims" ? trimsTab() : settingsTab());
   }
 
   function setupScreen() {
-    const input = h("input", { className: "grow", placeholder: "Client ID", autocapitalize: "off", autocomplete: "off", spellcheck: "false" });
-    return h("div", null,
+    const input = h("input", { className: "field", placeholder: "Paste your Client ID", autocapitalize: "off", autocomplete: "off", spellcheck: "false" });
+    const step = (n, ...content) => h("div", { className: "step" }, h("span", { className: "n" }, n), h("div", null, ...content));
+    return h("div", { className: "welcome" },
+      h("img", { className: "logo", src: "icon-180.png", alt: "" }),
       h("h1", null, "Playlist Plus"),
-      fatal && h("div", { className: "error" }, fatal),
-      h("div", { className: "card" },
-        h("p", null, "One-time setup (about 3 minutes, easiest on a computer). Spotify requires every app to have its own key:"),
-        h("ol", null,
-          h("li", null, "Go to ", h("a", { href: "https://developer.spotify.com/dashboard", target: "_blank", rel: "noopener" }, "developer.spotify.com/dashboard"), " and log in with your Spotify account."),
-          h("li", null, "Click ", h("b", null, "Create app"), ". Any name and description will do."),
-          h("li", null, "Under ", h("b", null, "Redirect URIs"), ", add exactly: ", h("code", null, redirectUri())),
-          h("li", null, "Under ", h("b", null, "APIs used"), ", tick ", h("b", null, "Web API"), ", then save."),
-          h("li", null, "Open the app's settings, copy the ", h("b", null, "Client ID"), " and paste it below."),
-        ),
-        h("div", { className: "row" },
-          input,
-          h("button", {
-            onClick: () => {
-              const v = input.value.trim();
-              if (!/^[0-9a-f]{32}$/i.test(v)) return toast("A Client ID is 32 letters and numbers.", true);
-              clientId = v;
-              save(KEY.clientId, v);
-              render();
-            },
-          }, "Save"),
-        ),
+      h("p", { className: "sub" }, "One-time setup, about 3 minutes. Spotify asks every app to have its own free key. Easiest on a computer."),
+      fatal && h("div", { className: "err" }, fatal),
+      h("div", { className: "steps" },
+        step(1, "Open ", h("a", { href: "https://developer.spotify.com/dashboard", target: "_blank", rel: "noopener" }, "developer.spotify.com/dashboard"), " and log in."),
+        step(2, "Tap ", h("b", null, "Create app"), ". Any name and description will do."),
+        step(3, "Add this ", h("b", null, "Redirect URI"), ":", h("br"), h("code", null, redirectUri())),
+        step(4, "Tick ", h("b", null, "Web API"), " and save."),
+        step(5, "Copy the app's ", h("b", null, "Client ID"), " and paste it below."),
       ),
+      input,
+      h("div", { className: "spacer" }),
+      h("button", { className: "btn block", onClick: () => {
+        const v = input.value.trim();
+        if (!/^[0-9a-f]{32}$/i.test(v)) return toast("A Client ID is 32 letters and numbers.", true);
+        clientId = v;
+        save(KEY.clientId, v);
+        render();
+      } }, "Continue"),
     );
   }
 
   function loginScreen() {
-    return h("div", null,
-      h("h1", null, "Playlist Plus"),
-      fatal && h("div", { className: "error" }, fatal),
-      h("div", { className: "card" },
-        h("p", null, "Connect your Spotify Premium account. Playlist Plus controls the Spotify app on your phone, so keep Spotify installed and logged in."),
-        h("div", { className: "row" },
-          h("button", { onClick: login }, "Connect Spotify"),
-          h("button", { className: "sec small", onClick: () => {
-            clientId = "";
-            localStorage.removeItem(KEY.clientId);
-            render();
-          } }, "Change Client ID"),
-        ),
-      ),
+    return h("div", { className: "welcome" },
+      h("img", { className: "logo", src: "icon-180.png", alt: "" }),
+      h("h1", null, "Trim songs.", h("br"), "Time your playlists."),
+      h("p", { className: "sub" }, "Playlist Plus controls the Spotify app on your phone. Spotify Premium required."),
+      fatal && h("div", { className: "err" }, fatal),
+      h("div", { className: "spacer" }),
+      h("div", { className: "spacer" }),
+      h("button", { className: "btn block", onClick: login }, "Continue with Spotify"),
+      h("div", { className: "spacer" }),
+      h("button", { className: "btn danger small", style: "color:var(--sub)", onClick: () => {
+        clientId = "";
+        localStorage.removeItem(KEY.clientId);
+        render();
+      } }, "Use a different Client ID"),
     );
   }
 
-  // Now playing + running session: refreshed often, without rebuilding the tab content.
+  // ----- live parts: mini player + running session --------------------------------
+  // Rebuilt when the song or phase changes; numbers and bars update in place.
+  const live = { key: null, refs: {} };
+
   function updateLive() {
+    if (!auth || !app.contains(main)) return;
     const s = player.state;
-    if (!auth) return;
-    if (!player.fetchedAt && !player.lastError) {
-      fill(nowPlayingBox, h("div", { className: "card muted" }, "Connecting to Spotify…"));
-    } else if (!s) {
-      fill(nowPlayingBox, h("div", { className: "card" },
-        h("b", null, "Nothing is playing"),
-        h("p", { className: "muted" }, player.lastError ? `Spotify: ${player.lastError}` : "Open the Spotify app, play any song, then come back here."),
-      ));
-    } else {
-      const pct = s.duration ? Math.min(100, (player.progress() / s.duration) * 100) : 0;
-      const trim = trims[s.uri];
-      fill(nowPlayingBox, h("div", { className: "card np" },
-        h("div", { className: "title" }, s.name),
-        h("div", { className: "muted" }, `${s.artist}${s.device ? " · on " + s.device.name : ""}`),
-        h("div", { className: "muted" }, `${s.playing ? "▶" : "❚❚"} ${formatTime(player.progress())} / ${formatTime(s.duration)}${trim ? `  ·  trimmed ${formatTime(trim.start || 0)}–${trim.end ? formatTime(trim.end) : "end"}` : ""}`),
-        h("div", { className: "bar" }, h("div", { style: `width:${pct}%` })),
-      ));
-    }
     const st = runner && runner.status();
-    if (!st) return fill(sessionBox);
-    fill(sessionBox, h("div", { className: "card session" },
-      h("div", { className: "muted" }, `Phase ${st.phaseIdx + 1} of ${st.phaseCount}`),
-      h("div", { className: "big" }, st.phaseName),
-      h("div", null, `${formatTime(st.phaseLeft)} left in phase`),
-      h("div", { className: "muted" }, `${formatTime(st.totalLeft)} left in session`),
-      h("div", { className: "row" },
-        h("button", { className: "sec small", onClick: () => runner.skipTrack() }, "Next song"),
-        st.phaseIdx + 1 < st.phaseCount && h("button", { className: "sec small", onClick: () => runner.skipPhase() }, "Next phase"),
-        h("button", { className: "sec small", onClick: stopSession }, "Stop"),
-      ),
-    ));
-  }
+    const showRunning = tab === "session" && st;
 
-  // ----- timed session tab -----------------------------------------------------
-  function sessionTab() {
-    let tpl = templates.find((t) => t.id === activeTemplateId) || templates[0];
-    const root = h("div");
-    const err = h("div", { className: "error" });
-    const planBox = h("div");
-    let playlists = playlistsCache || [];
-    const persist = () => saveTemplates();
-
-    const draw = () => {
-      const readable = playlists.filter((p) => p.readable);
-      const phaseCards = tpl.phases.map((ph, i) => {
-        const known = readable.some((p) => p.uri === ph.playlistUri);
-        return h("div", { className: "phase" },
-          h("div", { className: "row" },
-            h("input", { className: "name grow", value: ph.name, onChange: (e) => ((ph.name = e.target.value), persist()) }),
-            h("button", { className: "sec small", disabled: i === 0, "aria-label": "Move up", onClick: () => {
-              [tpl.phases[i - 1], tpl.phases[i]] = [tpl.phases[i], tpl.phases[i - 1]];
-              persist();
-              draw();
-            } }, "↑"),
-            h("button", { className: "sec small", "aria-label": "Remove phase", onClick: () => {
-              tpl.phases.splice(i, 1);
-              persist();
-              draw();
-            } }, "✕"),
+    // Mini player (hidden on the running-session screen, which shows the same thing big).
+    const miniKey = showRunning ? "hidden" : s ? `${s.uri}|${s.playing}|${s.device && s.device.name}` : `none|${player.lastError || ""}|${player.fetchedAt > 0}`;
+    if (mini.dataset.key !== miniKey) {
+      mini.dataset.key = miniKey;
+      mini.style.display = showRunning ? "none" : "";
+      if (s) {
+        fill(mini,
+          art(s.art, 40),
+          h("div", { className: "grow" },
+            h("div", { className: "t ellipsis" }, s.name),
+            s.device ? h("div", { className: "s dev ellipsis" }, icon(s.device.type === "Computer" ? "computer" : s.device.type === "Smartphone" ? "phone" : "speaker"), s.device.name) : h("div", { className: "s ellipsis" }, s.artist),
           ),
-          h("div", { className: "row" },
-            h("select", { className: "grow", onChange: (e) => ((ph.playlistUri = e.target.value), persist()) },
-              h("option", { value: "" }, playlistsCache ? "Choose playlist…" : "Loading playlists…"),
-              !known && ph.playlistUri && h("option", { value: ph.playlistUri, selected: true }, ph.playlistUri),
-              readable.map((p) => h("option", { value: p.uri, selected: p.uri === ph.playlistUri }, p.name)),
-            ),
-          ),
-          h("div", { className: "row" },
-            h("input", { className: "grow", placeholder: "…or paste a playlist link", autocapitalize: "off", onChange: (e) => {
-              const uri = normalizePlaylistUri(e.target.value);
-              if (!uri) return toast("That doesn't look like a playlist link.", true);
-              ph.playlistUri = uri;
-              persist();
-              draw();
-            } }),
-          ),
-          h("div", { className: "row" },
-            h("input", { type: "number", inputmode: "decimal", min: "0", step: "0.5", value: ph.value, disabled: ph.mode === "rest", onChange: (e) => ((ph.value = Number(e.target.value)), persist()) }),
-            h("select", { onChange: (e) => ((ph.mode = e.target.value), persist(), draw()) },
-              h("option", { value: "minutes", selected: ph.mode === "minutes" }, "minutes"),
-              h("option", { value: "percent", selected: ph.mode === "percent" }, "% of total"),
-              h("option", { value: "rest", selected: ph.mode === "rest" }, "remaining time"),
-            ),
+          trims[s.uri] && h("span", { className: "green", title: "Trimmed" }, icon("scissors")),
+          h("button", { className: "icon-btn", "aria-label": s.playing ? "Pause" : "Play", onClick: () => (player.togglePlay(), setTimeout(updateLive, 50)) }, icon(s.playing ? "pause" : "play")),
+          h("button", { className: "icon-btn", "aria-label": "Next", onClick: () => (runner && runner.active ? runner.skipTrack() : player.next()) }, icon("next")),
+          h("div", { className: "prog" }, h("i")),
+        );
+      } else {
+        fill(mini,
+          art(null, 40),
+          h("div", { className: "grow" },
+            h("div", { className: "t ellipsis" }, player.fetchedAt || player.lastError ? "Nothing playing" : "Connecting to Spotify…"),
+            h("div", { className: "s ellipsis" }, player.lastError ? player.lastError : "Open Spotify and play any song"),
           ),
         );
+      }
+    }
+    setMini(st ? phaseColor(st.phaseIdx) : "#535353");
+    const bar = mini.querySelector(".prog i");
+    if (bar && s && s.duration) bar.style.width = `${Math.min(100, (player.progress() / s.duration) * 100)}%`;
+
+    if (showRunning) updateRunning(st, s);
+    if (live.nowCard && live.nowCard.isConnected) {
+      const k = s ? s.uri : "";
+      if (live.nowCard.dataset.key !== k) {
+        live.nowCard.dataset.key = k;
+        drawNowCard(live.nowCard, s);
+      }
+    }
+  }
+
+  function drawNowCard(el, s) {
+    fill(el,
+      art(s && s.art, 56),
+      h("div", { className: "grow" },
+        h("div", { className: "tiny", style: "font-weight:700;text-transform:uppercase;letter-spacing:.08em" }, "Now playing"),
+        h("div", { className: "ellipsis", style: "font-weight:800" }, s ? s.name : "Nothing playing"),
+        h("div", { className: "sub ellipsis" }, s ? s.artist : "Play a song in Spotify to trim it"),
+      ),
+      s && h("button", { className: "btn small", onClick: () => openTrimSheet({ uri: s.uri, name: s.name, artist: s.artist, duration: s.duration, art: s.art }) }, icon("scissors"), "Trim"),
+    );
+  }
+
+  // ----- timed session tab -------------------------------------------------------
+  function sessionTab() {
+    if (runner && runner.active) {
+      live.root = h("div");
+      return live.root;
+    }
+    let tpl = templates.find((t) => t.id === activeTemplateId) || templates[0];
+    activeTemplateId = tpl.id;
+    const root = h("div");
+    const persist = () => saveTemplates();
+    const err = h("div", { className: "err" });
+    const timeline = h("div");
+    let busy = false;
+
+    const updateTimeline = () => {
+      setHero(phaseColor(0));
+      let budgets;
+      try {
+        budgets = computeBudgets(Number(tpl.totalMin) * 60000, tpl.phases);
+        err.textContent = "";
+      } catch (e) {
+        fill(timeline);
+        err.textContent = e.message;
+        return;
+      }
+      fill(timeline,
+        h("div", { className: "timeline" }, tpl.phases.map((ph, i) => h("div", { style: `--c:${phaseColor(i)};flex:${Math.max(budgets[i], 1)}` }, h("i")))),
+        h("div", { className: "legend" }, tpl.phases.map((ph, i) => h("span", { style: `--c:${phaseColor(i)}` }, `${ph.name} ${formatTime(budgets[i])}`))),
+      );
+    };
+
+    const draw = () => {
+      const totalPct = ((tpl.totalMin - 5) / (180 - 5)) * 100;
+      const lengthLabel = h("span", { className: "tnum" }, `${tpl.totalMin} min`);
+      const lengthRange = h("input", {
+        type: "range", min: "5", max: "180", step: "1", value: tpl.totalMin, style: `--pct:${totalPct}%`, "aria-label": "Session length",
+        onInput: (e) => {
+          tpl.totalMin = Number(e.target.value);
+          e.target.style.setProperty("--pct", `${((tpl.totalMin - 5) / 175) * 100}%`);
+          lengthLabel.textContent = `${tpl.totalMin} min`;
+          updateTimeline();
+        },
+        onChange: persist,
       });
 
       fill(root,
+        h("div", { className: "eyebrow" }, "Timed session"),
         h("div", { className: "row" },
-          h("select", { className: "grow", onChange: (e) => {
-            activeTemplateId = e.target.value;
-            tpl = templates.find((t) => t.id === activeTemplateId);
-            persist();
-            draw();
-          } }, templates.map((t) => h("option", { value: t.id, selected: t.id === tpl.id }, t.name))),
+          h("h1", { className: "grow ellipsis" }, tpl.name),
+          h("button", { className: "icon-btn", "aria-label": "Session options", onClick: () => actionSheet(tpl.name, [
+            { icon: "edit", label: "Rename", run: async () => {
+              const name = await promptSheet("Rename session", tpl.name);
+              if (name) (tpl.name = name), persist(), draw();
+            } },
+            { icon: "copy", label: "Duplicate", run: () => {
+              const copy = { ...JSON.parse(JSON.stringify(tpl)), id: String(Date.now()), name: `${tpl.name} (copy)` };
+              templates.push(copy);
+              activeTemplateId = copy.id;
+              tpl = copy;
+              persist();
+              draw();
+            } },
+            templates.length > 1 && { icon: "trash", label: "Delete", danger: true, run: async () => {
+              if (!(await confirmSheet(`Delete “${tpl.name}”?`, "This can't be undone.", "Delete"))) return;
+              templates = templates.filter((t) => t !== tpl);
+              tpl = templates[0];
+              activeTemplateId = tpl.id;
+              persist();
+              draw();
+            } },
+          ]) }, icon("more")),
         ),
-        h("div", { className: "row" },
-          h("button", { className: "sec small", onClick: () => {
-            const name = prompt("Name for the copy", tpl.name + " (copy)");
-            if (!name) return;
-            const copy = { ...JSON.parse(JSON.stringify(tpl)), id: String(Date.now()), name };
-            templates.push(copy);
-            activeTemplateId = copy.id;
-            tpl = copy;
-            persist();
-            draw();
-          } }, "Duplicate"),
-          h("button", { className: "sec small", onClick: () => {
-            const name = prompt("Rename", tpl.name);
-            if (!name) return;
-            tpl.name = name;
-            persist();
-            draw();
-          } }, "Rename"),
-          h("button", { className: "sec small", disabled: templates.length < 2, onClick: () => {
-            if (!confirm(`Delete "${tpl.name}"?`)) return;
-            templates = templates.filter((t) => t !== tpl);
-            tpl = templates[0];
-            activeTemplateId = tpl.id;
-            persist();
-            draw();
-          } }, "Delete"),
+        h("div", { className: "sub" }, `${tpl.phases.length} phase${tpl.phases.length === 1 ? "" : "s"} · `, lengthLabel),
+
+        // Play row, like a Spotify playlist header.
+        h("div", { className: "row", style: "margin-top:18px" },
+          h("button", { className: "icon-btn" + (tpl.shuffle ? " on" : ""), "aria-label": "Shuffle", title: "Shuffle within phases", onClick: () => ((tpl.shuffle = !tpl.shuffle), persist(), draw(), toast(tpl.shuffle ? "Shuffle on" : "Shuffle off")) }, icon("shuffle")),
+          h("button", { className: "icon-btn" + (tpl.smartFit ? " on" : ""), "aria-label": "Smart fit", title: "Smart fit", onClick: () => ((tpl.smartFit = !tpl.smartFit), persist(), draw(), toast(tpl.smartFit ? "Smart fit on: prefers songs that end before the phase does" : "Smart fit off")) }, icon("fit")),
+          h("button", { className: "icon-btn", "aria-label": "Preview plan", title: "Preview plan", onClick: () => run(true) }, icon("list")),
+          h("div", { className: "grow" }),
+          h("button", { className: "play-fab", "aria-label": "Start session", onClick: () => run(false) }, icon("play")),
         ),
-        h("div", { className: "row" },
-          h("span", null, "Length"),
-          h("input", { type: "number", inputmode: "numeric", min: "1", value: tpl.totalMin, onChange: (e) => ((tpl.totalMin = Number(e.target.value)), persist()) }),
-          h("span", null, "minutes"),
+
+        h("div", { className: "chips" },
+          templates.map((t) => h("button", { className: "chip" + (t === tpl ? " on" : ""), onClick: () => {
+            activeTemplateId = t.id;
+            tpl = t;
+            persist();
+            draw();
+          } }, t.name)),
+          h("button", { className: "chip", "aria-label": "New session", onClick: () => {
+            const t = { ...defaultTemplate(), name: "New session" };
+            templates.push(t);
+            activeTemplateId = t.id;
+            tpl = t;
+            persist();
+            draw();
+          } }, icon("plus"), "New"),
         ),
-        h("h2", null, "Phases (played in order)"),
-        phaseCards,
-        h("button", { className: "sec small", onClick: () => {
+
+        h("h2", null, "Length"),
+        h("div", { className: "card" },
+          lengthRange,
+          timeline,
+        ),
+        err,
+
+        h("h2", null, "Phases"),
+        tpl.phases.map((ph, i) => phaseCard(ph, i)),
+        h("button", { className: "add-phase", onClick: () => {
           tpl.phases.push({ name: `Phase ${tpl.phases.length + 1}`, playlistUri: "", mode: "minutes", value: 5 });
           persist();
           draw();
-        } }, "+ Add phase"),
-        h("p", { className: "muted" }, "“Remaining time” phases share whatever the others don't use. Without one, leftover time goes to the last phase. Only playlists you created (or collaborate on) can be used: Spotify doesn't let apps read other playlists."),
-        h("label", { className: "check" }, h("input", { type: "checkbox", checked: tpl.shuffle, onChange: (e) => ((tpl.shuffle = e.target.checked), persist()) }), "Shuffle within each phase"),
-        h("label", { className: "check" }, h("input", { type: "checkbox", checked: tpl.smartFit, onChange: (e) => ((tpl.smartFit = e.target.checked), persist()) }), "Smart fit (prefer songs that finish before the phase ends)"),
-        err,
-        h("div", { className: "row" },
-          h("button", { onClick: () => run(false) }, runner && runner.active ? "Restart session" : "Start session"),
-          h("button", { className: "sec", onClick: () => run(true) }, "Preview plan"),
-        ),
-        planBox,
+        } }, icon("plus"), "Add phase"),
+        h("p", { className: "tiny", style: "margin-top:14px" }, "Phases play in order. “Rest” phases share the time the others don't use; without one, leftover time goes to the last phase."),
       );
+      updateTimeline();
     };
+
+    function phaseCard(ph, i) {
+      const picker = h("button", { className: "picker", onClick: async () => {
+        const uri = await pickPlaylist(ph.name);
+        if (uri) (ph.playlistUri = uri), persist(), draw();
+      } });
+      const drawPicker = (meta) =>
+        fill(picker,
+          art(meta && meta.art, 44),
+          h("div", { className: "grow" },
+            h("div", { className: "ellipsis", style: "font-weight:700" }, meta ? meta.name : "Choose a playlist"),
+            h("div", { className: "tiny" }, meta ? (meta.total != null ? `${meta.total} songs` : "Playlist") : "Tap to pick from your library"),
+          ),
+          icon("chevronRight"),
+        );
+      drawPicker(null);
+      if (ph.playlistUri) {
+        fill(picker.children[1].firstChild, "Loading…");
+        getPlaylistMeta(ph.playlistUri).then(drawPicker);
+      }
+
+      const setMode = (m) => () => {
+        ph.mode = m;
+        if (m === "percent" && !(ph.value > 0 && ph.value <= 100)) ph.value = 20;
+        persist();
+        draw();
+      };
+      const valueIn = h("input", {
+        type: "number", inputmode: "decimal", min: "0", value: ph.value, "aria-label": "Amount",
+        onChange: (e) => ((ph.value = Math.max(0, Number(e.target.value) || 0)), persist(), updateTimeline()),
+      });
+      const step = (d) => () => {
+        ph.value = Math.max(0, (Number(ph.value) || 0) + d * (ph.mode === "percent" ? 5 : 1));
+        valueIn.value = ph.value;
+        persist();
+        updateTimeline();
+      };
+
+      return h("div", { className: "phase", style: `--c:${phaseColor(i)}` },
+        h("div", { className: "row" },
+          h("input", { className: "name-input grow", value: ph.name, "aria-label": "Phase name", onChange: (e) => ((ph.name = e.target.value || `Phase ${i + 1}`), persist(), updateTimeline()) }),
+          h("button", { className: "icon-btn", "aria-label": "Phase options", onClick: () => actionSheet(ph.name, [
+            i > 0 && { icon: "up", label: "Move up", run: () => {
+              [tpl.phases[i - 1], tpl.phases[i]] = [tpl.phases[i], tpl.phases[i - 1]];
+              persist();
+              draw();
+            } },
+            i < tpl.phases.length - 1 && { icon: "down", label: "Move down", run: () => {
+              [tpl.phases[i + 1], tpl.phases[i]] = [tpl.phases[i], tpl.phases[i + 1]];
+              persist();
+              draw();
+            } },
+            { icon: "trash", label: "Remove phase", danger: true, run: () => {
+              tpl.phases.splice(i, 1);
+              persist();
+              draw();
+            } },
+          ]) }, icon("more")),
+        ),
+        picker,
+        h("div", { className: "row", style: "flex-wrap:wrap;gap:8px" },
+          h("div", { className: "seg" },
+            h("button", { className: ph.mode === "minutes" ? "on" : "", onClick: setMode("minutes") }, "Minutes"),
+            h("button", { className: ph.mode === "percent" ? "on" : "", onClick: setMode("percent") }, "Percent"),
+            h("button", { className: ph.mode === "rest" ? "on" : "", onClick: setMode("rest") }, "Rest"),
+          ),
+          ph.mode !== "rest" &&
+            h("div", { className: "stepper" },
+              h("button", { "aria-label": "Less", onClick: step(-1) }, icon("minus")),
+              valueIn,
+              h("span", { className: "unit" }, ph.mode === "percent" ? "%" : "min"),
+              h("button", { "aria-label": "More", onClick: step(1) }, icon("plus")),
+            ),
+        ),
+      );
+    }
 
     async function buildPlan() {
       const budgets = computeBudgets(Number(tpl.totalMin) * 60000, tpl.phases);
@@ -556,305 +805,516 @@
       for (let i = 0; i < tpl.phases.length; i++) {
         const ph = tpl.phases[i];
         if (budgets[i] <= 0) continue;
-        if (!ph.playlistUri) throw new Error(`Choose a playlist for "${ph.name}".`);
+        if (!ph.playlistUri) throw new Error(`Choose a playlist for “${ph.name}”.`);
         let pool;
         try {
           pool = await loadPlaylistTracks(ph.playlistUri);
         } catch (e) {
-          throw new Error(`"${ph.name}": ${e.message}`);
+          throw new Error(`${ph.name}: ${e.message}`);
         }
-        if (!pool.length) throw new Error(`The playlist for "${ph.name}" has no playable songs.`);
+        if (!pool.length) throw new Error(`The playlist for “${ph.name}” has no playable songs.`);
         const prev = phases.length ? phases[phases.length - 1].items.slice(-1)[0] : null;
         const items = planPhase(pool, budgets[i], { shuffle: tpl.shuffle, smartFit: tpl.smartFit, trims: trimMap, prevUri: prev && prev.uri });
-        phases.push({ name: ph.name, budget: budgets[i], pool, items });
+        phases.push({ name: ph.name, color: phaseColor(i), budget: budgets[i], pool, items });
       }
       if (!phases.length) throw new Error("No phase has any time assigned.");
       return phases;
     }
 
+    async function run(previewOnly) {
+      if (busy) return;
+      busy = true;
+      err.textContent = "";
+      try {
+        const phases = await buildPlan();
+        if (previewOnly) showPlan(phases);
+        else startSession(phases);
+      } catch (e) {
+        err.textContent = e.message;
+        toast(e.message, true);
+      } finally {
+        busy = false;
+      }
+    }
+
     function showPlan(phases) {
-      fill(planBox,
-        h("h2", null, "Plan"),
+      const close = openSheet(h("div", null,
+        h("h3", null, `${tpl.name} · ${tpl.totalMin} min`),
         phases.map((ph) => {
           let t = 0;
           const rows = [];
           for (const it of ph.items) {
             if (t >= ph.budget) break;
             const plays = Math.min(it.length, ph.budget - t);
-            rows.push(h("li", null,
-              h("span", { className: "muted" }, formatTime(t)),
-              h("div", { className: "grow" }, h("div", { className: "name" }, it.name), h("div", { className: "muted name" }, it.artist)),
-              h("span", { className: "muted" }, plays < it.length ? `${formatTime(plays)}✂` : formatTime(plays)),
+            const cut = plays < it.length;
+            rows.push(h("div", { className: "item" },
+              art(it.art, 44),
+              h("div", { className: "grow" },
+                h("div", { className: "t ellipsis" }, it.name),
+                h("div", { className: "s ellipsis" }, it.length < it.duration && h("span", { className: "green" }, icon("scissors")), it.artist),
+              ),
+              h("div", { className: "end tnum" + (cut ? " green" : "") }, cut ? `${formatTime(plays)} ✂` : formatTime(plays)),
             ));
             t += it.length;
           }
-          return h("div", { className: "card" }, h("b", null, `${ph.name} · ${formatTime(ph.budget)}`), h("ul", { className: "list" }, rows));
+          return h("div", { style: "margin-bottom:16px" },
+            h("div", { className: "row", style: `--c:${ph.color}` },
+              h("span", { style: `width:10px;height:10px;border-radius:50%;background:${ph.color}` }),
+              h("b", { className: "grow" }, ph.name),
+              h("span", { className: "sub tnum" }, formatTime(ph.budget)),
+            ),
+            h("div", { className: "list" }, rows),
+          );
         }),
-        h("button", { onClick: () => startSession(phases) }, "Start this plan"),
-      );
-    }
-
-    async function run(previewOnly) {
-      err.textContent = "";
-      fill(planBox, h("p", { className: "muted" }, "Loading playlists…"));
-      try {
-        const phases = await buildPlan();
-        if (previewOnly) showPlan(phases);
-        else {
-          fill(planBox);
-          startSession(phases);
-        }
-      } catch (e) {
-        fill(planBox);
-        err.textContent = e.message;
-      }
+        h("div", { style: "position:sticky;bottom:calc(-20px - var(--safe-b));margin:0 -16px calc(-20px - var(--safe-b));padding:28px 16px calc(20px + var(--safe-b));background:linear-gradient(rgba(36,36,36,0),#242424 40%)" },
+          h("button", { className: "btn block", onClick: () => (close(), startSession(phases)) }, icon("play"), "Start this plan"),
+        ),
+      ));
     }
 
     draw();
-    if (!playlistsCache) {
-      listPlaylists()
-        .then((p) => {
-          playlists = p;
-          if (root.isConnected) draw();
-        })
-        .catch((e) => (err.textContent = `Couldn't load your playlists: ${e.message}`));
-    }
+    if (!playlistsCache) listPlaylists().catch(() => {});
     return root;
   }
 
-  // ----- trims tab -------------------------------------------------------------
-  let editing = null; // { uri, name, artist, duration }
+  function pickPlaylist(phaseName) {
+    return new Promise((resolve) => {
+      let result = null;
+      const listEl = h("div", { className: "list" }, h("div", { className: "empty" }, "Loading your playlists…"));
+      const search = h("input", { className: "field", placeholder: "Search your playlists", autocomplete: "off", onInput: () => draw() });
+      const link = h("input", { className: "field", placeholder: "Paste a playlist link", autocapitalize: "off", autocomplete: "off" });
+      let all = [];
+      const draw = () => {
+        const q = search.value.trim().toLowerCase();
+        const shown = all.filter((p) => p.readable && p.name.toLowerCase().includes(q));
+        fill(listEl, shown.length
+          ? shown.map((p) => h("button", { className: "item", onClick: () => ((result = p.uri), close()) },
+              art(p.art, 52),
+              h("div", { className: "grow" }, h("div", { className: "t ellipsis" }, p.name), h("div", { className: "s" }, `Playlist${p.total != null ? ` · ${p.total} songs` : ""}`)),
+            ))
+          : h("div", { className: "empty" }, icon("search"), q ? "No playlists match." : "No playlists of your own yet."));
+      };
+      const close = openSheet(h("div", null,
+        h("h3", null, `Playlist for ${phaseName}`),
+        h("div", { className: "search" }, icon("search"), search),
+        h("div", { className: "spacer" }),
+        listEl,
+        h("p", { className: "tiny" }, "Only playlists you created or collaborate on are shown: Spotify doesn't let apps read other playlists. To use one, add its songs to a playlist of your own."),
+        h("div", { className: "row" },
+          h("div", { className: "grow" }, link),
+          h("button", { className: "btn small", onClick: () => {
+            const uri = normalizePlaylistUri(link.value);
+            if (!uri) return toast("That doesn't look like a playlist link.", true);
+            result = uri;
+            close();
+          } }, "Use"),
+        ),
+      ), { onClose: () => resolve(result) });
+      listPlaylists()
+        .then((p) => ((all = p), draw()))
+        .catch((e) => fill(listEl, h("div", { className: "err" }, `Couldn't load your playlists: ${e.message}`)));
+    });
+  }
 
-  function trimEditor(track, rerender) {
-    const existing = trims[track.uri] || {};
-    const fmt = (ms) => (ms ? formatTime(ms) : "");
-    const startIn = h("input", { className: "time", inputmode: "decimal", placeholder: "0:00", value: fmt(existing.start) });
-    const endIn = h("input", { className: "time", inputmode: "decimal", placeholder: "end", value: fmt(existing.end) });
-    const err = h("div", { className: "error" });
-    const isCurrent = () => player.currentUri() === track.uri;
-    const nowBtn = (input) =>
-      h("button", { className: "sec small", onClick: () => {
-        if (!isCurrent()) return toast("Play this song first to use its current position.", true);
-        input.value = formatTime(player.progress());
-      } }, "Now");
-    const read = () => {
-      const start = parseTime(startIn.value) || 0;
-      const end = parseTime(endIn.value);
-      if (Number.isNaN(start) || Number.isNaN(end)) return { error: "Use m:ss, e.g. 1:05." };
-      if (end != null && end <= start + 5000) return { error: "End must be at least 5 seconds after start." };
-      if (track.duration && end != null && end > track.duration) return { error: `End is past the song's length (${formatTime(track.duration)}).` };
-      if (track.duration && start >= track.duration) return { error: "Start is past the end of the song." };
-      return { start, end };
+  // Running session: big countdown, phase progress, now playing and controls.
+  function updateRunning(st, s) {
+    const root = live.root;
+    if (!root || !root.isConnected) return;
+    const item = st.item;
+    const nowUri = s ? s.uri : item.uri;
+    const key = `${st.phaseIdx}|${runner.itemIdx}|${nowUri}|${s && s.playing}`;
+    const color = runner.phases[st.phaseIdx].color || phaseColor(st.phaseIdx);
+    setHero(color);
+    if (live.key !== key) {
+      live.key = key;
+      const playing = s && s.uri === item.uri ? s : null;
+      const r = (live.refs = {});
+      const segs = runner.phases.map((p, i) => {
+        const fillEl = h("i");
+        r[`seg${i}`] = fillEl;
+        return h("div", { style: `--c:${p.color || phaseColor(i)};flex:${p.budget}` }, fillEl);
+      });
+      const upcoming = [];
+      for (let pi = runner.phaseIdx, ii = runner.itemIdx + 1; pi < runner.phases.length && upcoming.length < 3; ii++) {
+        if (ii >= runner.phases[pi].items.length) {
+          pi++;
+          ii = -1;
+          continue;
+        }
+        upcoming.push({ ...runner.phases[pi].items[ii], phase: runner.phases[pi] });
+      }
+      const nextPhase = runner.phases[st.phaseIdx + 1];
+      fill(root,
+        h("div", { className: "eyebrow" }, `Phase ${st.phaseIdx + 1} of ${st.phaseCount}`),
+        h("h1", null, st.phaseName),
+        h("div", { className: "row", style: "align-items:flex-end;margin-top:14px" },
+          (r.countdown = h("div", { className: "countdown tnum" })),
+        ),
+        (r.sub = h("div", { className: "sub", style: "margin-top:6px" })),
+        h("div", { className: "timeline big" }, segs),
+        art((playing && playing.bigArt) || item.art, null, { className: "big-art" }),
+        h("div", { className: "row", style: "margin-top:20px" },
+          art((playing && playing.art) || item.art, 56, { className: "small-art" }),
+          h("div", { className: "grow" },
+            h("div", { className: "ellipsis", style: "font-size:22px;font-weight:800;letter-spacing:-.02em" }, (playing && playing.name) || item.name),
+            h("div", { className: "sub ellipsis" }, (playing && playing.artist) || item.artist),
+          ),
+          item.length < item.duration && h("span", { className: "green", title: "Trimmed" }, icon("scissors")),
+        ),
+        h("div", { className: "songbar" }, (r.songFill = h("i"))),
+        (r.times = h("div", { className: "row tiny tnum", style: "justify-content:space-between;margin-top:-4px" }, h("span"), h("span"))),
+        h("div", { className: "controls" },
+          h("button", { className: "icon-btn", "aria-label": "Stop session", onClick: () => stopSession(true) }, icon("stop")),
+          h("div", { style: "width:48px" }),
+          h("button", { className: "main-btn", "aria-label": s && s.playing ? "Pause" : "Play", onClick: () => (player.togglePlay(), setTimeout(updateLive, 50)) }, icon(s && s.playing ? "pause" : "play")),
+          h("button", { className: "icon-btn", "aria-label": "Next song", onClick: () => runner.skipTrack() }, icon("next")),
+          h("button", { className: "icon-btn", "aria-label": "Next phase", disabled: !nextPhase, onClick: () => runner.skipPhase() }, icon("forward")),
+        ),
+        nextPhase && h("div", { style: "text-align:center;margin-top:4px" },
+          h("span", { className: "tiny" }, `Up next: ${nextPhase.name} · ${formatTime(nextPhase.budget)}`),
+        ),
+        upcoming.length > 0 && h("h2", null, "Next in queue"),
+        h("div", { className: "list" }, upcoming.map((u) =>
+          h("div", { className: "item" },
+            art(u.art, 48),
+            h("div", { className: "grow" },
+              h("div", { className: "t ellipsis" }, u.name),
+              h("div", { className: "s ellipsis" }, u.phase !== runner.phase && h("span", { style: `color:${u.phase.color}` }, `${u.phase.name} · `), u.artist),
+            ),
+            h("div", { className: "end tnum" }, formatTime(u.length)),
+          ),
+        )),
+      );
+    }
+    const r = live.refs;
+    r.countdown.textContent = formatTime(st.phaseLeft);
+    r.sub.textContent = `left in ${st.phaseName} · ${formatTime(st.totalLeft)} left in session`;
+    runner.phases.forEach((p, i) => {
+      const pct = i < st.phaseIdx ? 100 : i > st.phaseIdx ? 0 : Math.min(100, ((p.budget - st.phaseLeft) / p.budget) * 100);
+      r[`seg${i}`].style.setProperty("--p", `${pct}%`);
+    });
+    // Song progress within the kept (trimmed) part.
+    const pos = s && s.uri === item.uri ? player.progress() : item.start;
+    const pct = Math.max(0, Math.min(1, (pos - item.start) / Math.max(1, item.end - item.start)));
+    r.songFill.style.width = `${pct * 100}%`;
+    r.times.children[0].textContent = formatTime(Math.max(0, pos - item.start));
+    r.times.children[1].textContent = `-${formatTime(Math.max(0, item.end - pos))}`;
+  }
+
+  // ----- trims ----------------------------------------------------------------------
+  async function openTrimSheet(track) {
+    let t = { ...track };
+    if (!t.duration || !t.art) {
+      try {
+        t = { ...t, ...(await getTrack(t.uri)) };
+      } catch {
+        /* keep what we have */
+      }
+    }
+    if (!t.duration) return toast("Couldn't load this song from Spotify.", true);
+    const dur = t.duration;
+    const existing = trims[t.uri] || {};
+    let start = existing.start || 0;
+    let end = existing.end || dur;
+    const isCurrent = () => player.currentUri() === t.uri;
+
+    const BARS = 40;
+    const bars = Array.from({ length: BARS }, () => h("i", { style: "height:100%" }));
+    const playhead = h("div", { className: "playhead" });
+    const rs = h("input", { type: "range", min: "0", max: String(dur), step: "500", value: String(start), "aria-label": "Start" });
+    const re = h("input", { type: "range", min: "0", max: String(dur), step: "500", value: String(end), "aria-label": "End" });
+    const startIn = h("input", { className: "v tnum", inputmode: "decimal", "aria-label": "Start time" });
+    const endIn = h("input", { className: "v tnum", inputmode: "decimal", "aria-label": "End time" });
+    const plays = h("div", { className: "v tnum" });
+    const err = h("div", { className: "err" });
+
+    const update = () => {
+      bars.forEach((b, i) => b.classList.toggle("in", ((i + 0.5) / BARS) * dur >= start && ((i + 0.5) / BARS) * dur <= end));
+      rs.value = String(start);
+      re.value = String(end);
+      if (document.activeElement !== startIn) startIn.value = formatTime(start);
+      if (document.activeElement !== endIn) endIn.value = formatTime(end);
+      plays.textContent = formatTime(end - start);
+      err.textContent = "";
     };
-    const close = () => {
-      editing = null;
-      rerender();
+    rs.addEventListener("input", () => ((start = Math.min(Number(rs.value), end - 5000)), update()));
+    re.addEventListener("input", () => ((end = Math.max(Number(re.value), start + 5000)), update()));
+    const fromField = (input, which) => () => {
+      const v = parseTime(input.value);
+      if (v == null || Number.isNaN(v)) return update();
+      if (which === "start") start = Math.max(0, Math.min(v, end - 5000));
+      else end = Math.min(dur, Math.max(v, start + 5000));
+      update();
     };
-    return h("div", { className: "card" },
-      h("b", null, `Trim: ${track.name}`),
-      h("div", { className: "muted" }, `${track.artist || ""}${track.duration ? " · " + formatTime(track.duration) : ""}`),
-      h("div", { className: "row" }, h("span", { style: "width:44px" }, "Start"), startIn, nowBtn(startIn)),
-      h("div", { className: "row" }, h("span", { style: "width:44px" }, "End"), endIn, nowBtn(endIn)),
-      h("div", { className: "muted" }, "Leave End empty to play to the end. Tap “Now” while the song plays to grab its position."),
-      err,
-      h("div", { className: "row" },
-        h("button", { onClick: () => {
-          const r = read();
-          if (r.error) return (err.textContent = r.error);
-          if (!r.start && r.end == null) delete trims[track.uri];
-          else trims[track.uri] = { start: r.start, end: r.end, name: track.name, artist: track.artist };
-          saveTrims();
-          toast(trims[track.uri] ? `Trimmed “${track.name}”` : `Removed trim from “${track.name}”`);
-          close();
-        } }, "Save"),
-        h("button", { className: "sec small", onClick: () => {
-          const r = read();
-          if (r.error) return (err.textContent = r.error);
-          player.play(track.uri, r.start || 0);
-        } }, "Play from start"),
-        h("button", { className: "sec small", onClick: () => {
-          const r = read();
-          if (r.error) return (err.textContent = r.error);
-          if (r.end == null) return (err.textContent = "No end point set.");
-          const at = Math.max(r.start || 0, r.end - 5000);
-          if (isCurrent()) player.seek(at);
-          else player.play(track.uri, at);
-        } }, "Hear the end"),
-        trims[track.uri] && h("button", { className: "sec small", onClick: () => {
-          delete trims[track.uri];
-          saveTrims();
-          close();
-        } }, "Remove"),
-        h("button", { className: "sec small", onClick: close }, "Cancel"),
+    startIn.addEventListener("change", fromField(startIn, "start"));
+    endIn.addEventListener("change", fromField(endIn, "end"));
+
+    const nowChip = (label, which) =>
+      h("button", { className: "chip", onClick: () => {
+        if (!isCurrent()) return toast("Play this song first, then tap to use its position.", true);
+        const p = Math.round(player.progress() / 500) * 500;
+        if (which === "start") start = Math.max(0, Math.min(p, end - 5000));
+        else end = Math.min(dur, Math.max(p, start + 5000));
+        update();
+      } }, icon("timer"), label);
+
+    const tickHead = setInterval(() => {
+      const show = isCurrent();
+      playhead.style.display = show ? "block" : "none";
+      if (show) playhead.style.left = `${Math.min(100, (player.progress() / dur) * 100)}%`;
+    }, 250);
+
+    const close = openSheet(h("div", null,
+      h("div", { className: "row", style: "margin-bottom:6px" },
+        art(t.art, 56),
+        h("div", { className: "grow" },
+          h("div", { className: "ellipsis", style: "font-size:18px;font-weight:800" }, t.name),
+          h("div", { className: "sub ellipsis" }, t.artist),
+        ),
       ),
-    );
+      h("div", { className: "stats" },
+        h("div", null, startIn, h("div", { className: "k" }, "Start")),
+        h("div", null, plays, h("div", { className: "k" }, "Plays")),
+        h("div", null, endIn, h("div", { className: "k" }, "End")),
+      ),
+      h("div", { className: "trim-track" }, h("div", { className: "bars" }, bars), playhead, rs, re),
+      h("div", { className: "row tiny tnum", style: "justify-content:space-between" }, h("span", null, "0:00"), h("span", null, formatTime(dur))),
+      h("div", { className: "chips", style: "margin-top:12px" },
+        nowChip("Start here", "start"),
+        nowChip("End here", "end"),
+        h("button", { className: "chip", onClick: () => player.play(t.uri, start) }, icon("play"), "From start"),
+        h("button", { className: "chip", onClick: () => {
+          const at = Math.max(start, end - 5000);
+          if (isCurrent()) player.seek(at);
+          else player.play(t.uri, at);
+        } }, icon("play"), "Hear the end"),
+      ),
+      err,
+      h("div", { className: "spacer" }),
+      h("button", { className: "btn block", onClick: () => {
+        const full = start === 0 && end >= dur;
+        if (full) delete trims[t.uri];
+        else trims[t.uri] = { start, end: end >= dur ? null : end, name: t.name, artist: t.artist, art: t.art || null };
+        saveTrims();
+        toast(full ? `“${t.name}” plays in full` : `Trimmed “${t.name}”`);
+        close();
+        if (tab === "trims") renderTab();
+      } }, icon("check"), "Save trim"),
+      trims[t.uri] && h("div", { style: "text-align:center;margin-top:8px" },
+        h("button", { className: "btn danger small", onClick: () => {
+          delete trims[t.uri];
+          saveTrims();
+          toast(`Removed trim from “${t.name}”`);
+          close();
+          if (tab === "trims") renderTab();
+        } }, "Remove trim"),
+      ),
+    ), { onClose: () => clearInterval(tickHead) });
+    update();
   }
 
   function trimsTab() {
-    const root = h("div");
-    const browseBox = h("div");
-    const io = h("textarea", { placeholder: "Paste trims exported from the desktop extension (or another phone) here" });
+    setHero("#e8115b");
+    const entries = Object.entries(trims).sort((a, b) => (a[1].name || "").localeCompare(b[1].name || ""));
+    const shelf = h("div", { className: "chips", style: "gap:12px" });
+    const songs = h("div", { className: "list" });
+    let openUri = null;
 
-    const draw = () => {
-      const s = player.state;
-      const entries = Object.entries(trims);
-      fill(root,
-        editing
-          ? trimEditor(editing, draw)
-          : h("div", { className: "row" },
-              h("button", { disabled: !s, onClick: () => {
-                editing = { uri: s.uri, name: s.name, artist: s.artist, duration: s.duration };
-                draw();
-              } }, s ? "Trim the song that's playing" : "Play a song to trim it"),
-            ),
-        h("h2", null, "Find a song in your playlists"),
-        browseBox,
-        h("h2", null, `Trimmed songs (${entries.length})`),
-        entries.length
-          ? h("ul", { className: "list" },
-              entries.map(([uri, t]) =>
-                h("li", null,
-                  h("div", { className: "grow" },
-                    h("div", { className: "name" }, t.name || uri),
-                    h("div", { className: "muted" }, `${formatTime(t.start || 0)} – ${t.end ? formatTime(t.end) : "end"}${t.artist ? " · " + t.artist : ""}`),
-                  ),
-                  h("button", { className: "sec small", onClick: () => {
-                    editing = { uri, name: t.name || uri, artist: t.artist, duration: null };
-                    draw();
-                    window.scrollTo({ top: 0, behavior: "smooth" });
-                  } }, "Edit"),
-                ),
-              ),
-            )
-          : h("p", { className: "muted" }, "No trimmed songs yet."),
-        h("h2", null, "Copy trims between devices"),
-        h("p", { className: "muted" }, "Trims are saved on this phone. To copy them from the desktop extension: export there, send yourself the text, paste it here and import."),
-        io,
-        h("div", { className: "row" },
-          h("button", { className: "sec small", onClick: async () => {
-            io.value = JSON.stringify(trims);
-            try {
-              await navigator.clipboard.writeText(io.value);
-              toast("Copied to clipboard");
-            } catch {
-              io.select();
-            }
-          } }, "Export"),
-          h("button", { className: "sec small", onClick: () => {
-            try {
-              const data = JSON.parse(io.value);
-              if (typeof data !== "object" || !data || Array.isArray(data)) throw new Error();
-              Object.assign(trims, data);
-              saveTrims();
-              toast("Trims imported");
-              draw();
-            } catch {
-              toast("That isn't valid trim data.", true);
-            }
-          } }, "Import (merge)"),
-        ),
-      );
-    };
-
-    // Playlist browser: pick a playlist, tap a song to trim it.
-    const drawBrowse = async () => {
-      fill(browseBox, h("p", { className: "muted" }, "Loading playlists…"));
-      let pls;
+    const loadShelf = async () => {
+      fill(shelf, h("span", { className: "tiny" }, "Loading your playlists…"));
       try {
-        pls = (await listPlaylists()).filter((p) => p.readable);
+        const pls = (await listPlaylists()).filter((p) => p.readable);
+        if (!pls.length) return fill(shelf, h("span", { className: "tiny" }, "No playlists of your own yet."));
+        fill(shelf, pls.map((p) =>
+          h("button", { style: "width:120px;flex:none;text-align:left", onClick: async () => {
+            if (openUri === p.uri) {
+              openUri = null;
+              return fill(songs);
+            }
+            openUri = p.uri;
+            fill(songs, h("div", { className: "empty" }, "Loading songs…"));
+            try {
+              const tracks = await loadPlaylistTracks(p.uri);
+              fill(songs, h("h2", { style: "margin-top:16px" }, p.name), tracks.map((tr) => songRow(tr, trims[tr.uri] ? trimLabel(trims[tr.uri]) : formatTime(tr.duration))));
+            } catch (e) {
+              fill(songs, h("div", { className: "err" }, e.message));
+            }
+          } },
+            art(p.art, 120),
+            h("div", { className: "ellipsis", style: "font-size:13px;font-weight:700;margin-top:8px" }, p.name),
+            h("div", { className: "tiny" }, p.total != null ? `${p.total} songs` : "Playlist"),
+          ),
+        ));
       } catch (e) {
-        return fill(browseBox, h("div", { className: "error" }, e.message));
+        fill(shelf, h("div", { className: "err" }, e.message));
       }
-      const list = h("ul", { className: "list" });
-      const sel = h("select", { className: "grow", onChange: async (e) => {
-        if (!e.target.value) return fill(list);
-        fill(list, h("li", { className: "muted" }, "Loading…"));
-        try {
-          const tracks = await loadPlaylistTracks(e.target.value);
-          fill(list, tracks.map((t) =>
-            h("li", { onClick: () => {
-              editing = t;
-              draw();
-              window.scrollTo({ top: 0, behavior: "smooth" });
-            } },
-              h("div", { className: "grow" }, h("div", { className: "name" }, t.name), h("div", { className: "muted name" }, t.artist)),
-              h("span", { className: "muted" }, trims[t.uri] ? "✂ trimmed" : formatTime(t.duration)),
-            ),
-          ));
-        } catch (err) {
-          fill(list, h("li", { className: "error" }, err.message));
-        }
-      } }, h("option", { value: "" }, "Choose a playlist…"), pls.map((p) => h("option", { value: p.uri }, p.name)));
-      fill(browseBox, h("div", { className: "row" }, sel), list);
     };
 
-    draw();
-    drawBrowse();
+    const trimLabel = (tr) => `${formatTime(tr.start || 0)} – ${tr.end ? formatTime(tr.end) : "end"}`;
+    const songRow = (tr, sub, trimmed = !!trims[tr.uri]) =>
+      h("button", { className: "item", onClick: () => openTrimSheet(tr) },
+        art(tr.art, 48),
+        h("div", { className: "grow" },
+          h("div", { className: "t ellipsis" }, tr.name),
+          h("div", { className: "s ellipsis" + (trimmed ? " green" : "") }, trimmed && icon("scissors"), trimmed ? sub : tr.artist),
+        ),
+        h("div", { className: "end tnum" }, trimmed ? "" : sub),
+        icon("chevronRight"),
+      );
+
+    const root = h("div", null,
+      h("div", { className: "eyebrow" }, "Your library"),
+      h("h1", null, "Trims"),
+      h("div", { className: "sub" }, entries.length ? `${entries.length} song${entries.length === 1 ? "" : "s"} trimmed` : "Cut the intro or outro off any song"),
+      (live.nowCard = h("div", { className: "card", style: "margin-top:20px;display:flex;align-items:center;gap:12px" })),
+      h("h2", null, "Trimmed songs"),
+      entries.length
+        ? h("div", { className: "list" }, entries.map(([uri, tr]) => songRow({ uri, name: tr.name || uri, artist: tr.artist, art: tr.art, duration: null }, trimLabel(tr), true)))
+        : h("div", { className: "empty" }, icon("scissors"), "No trims yet. Trim the song that's playing, or pick one from your playlists below."),
+      h("h2", null, "Your playlists"),
+      shelf,
+      songs,
+    );
+    loadShelf();
     return root;
   }
 
-  // ----- settings tab ----------------------------------------------------------
+  // ----- settings tab -----------------------------------------------------------------
   function settingsTab() {
-    const devBox = h("div");
-    const cb = (key, label) =>
-      h("label", { className: "check" }, h("input", { type: "checkbox", checked: settings[key], onChange: (e) => ((settings[key] = e.target.checked), saveSettings()) }), label);
+    setHero("#535353");
+    const devBox = h("div", { className: "list" });
+    const setting = (title, desc, control, onClick) =>
+      h(onClick ? "button" : "div", { className: "setting", onClick },
+        h("div", { className: "grow" }, h("div", { className: "t" }, title), desc && h("div", { className: "s" }, desc)),
+        control,
+      );
+    const switchSetting = (key, title, desc) =>
+      setting(title, desc, toggle(settings[key], (v) => ((settings[key] = v), saveSettings())));
+
+    const fadeIn = h("input", { type: "number", inputmode: "numeric", value: settings.fadeSeconds, "aria-label": "Fade seconds", onChange: (e) => {
+      settings.fadeSeconds = Math.max(0, Math.min(15, Number(e.target.value) || 0));
+      e.target.value = settings.fadeSeconds;
+      saveSettings();
+    } });
+    const fadeStep = (d) => () => {
+      settings.fadeSeconds = Math.max(0, Math.min(15, settings.fadeSeconds + d));
+      fadeIn.value = settings.fadeSeconds;
+      saveSettings();
+    };
+
+    const deviceIcon = (type) => icon(type === "Computer" ? "computer" : type === "Smartphone" ? "phone" : "speaker");
     const drawDevices = async () => {
-      fill(devBox, h("p", { className: "muted" }, "Looking for devices…"));
+      fill(devBox, h("div", { className: "tiny", style: "padding:12px 0" }, "Looking for devices…"));
       try {
         const { devices } = await api("GET", "/me/player/devices");
         fill(devBox,
           devices.length
-            ? h("ul", { className: "list" }, devices.map((d) =>
-                h("li", null,
-                  h("div", { className: "grow" }, h("div", { className: "name" }, d.name), h("div", { className: "muted" }, d.type + (d.is_active ? " · active" : ""))),
-                  !d.is_active && h("button", { className: "sec small", onClick: async () => {
-                    try {
-                      await api("PUT", "/me/player", { device_ids: [d.id], play: false });
-                      player.chosenDevice = d.id;
-                      toast(`Using ${d.name}`);
-                      player.pollSoon();
-                      setTimeout(drawDevices, 800);
-                    } catch (e) {
-                      toast(e.message, true);
-                    }
-                  } }, "Use"),
+            ? devices.map((d) =>
+                h("button", { className: "item", onClick: async () => {
+                  if (d.is_active) return;
+                  try {
+                    await api("PUT", "/me/player", { device_ids: [d.id], play: false });
+                    player.chosenDevice = d.id;
+                    toast(`Playing on ${d.name}`);
+                    player.pollSoon();
+                    setTimeout(drawDevices, 800);
+                  } catch (e) {
+                    toast(e.message, true);
+                  }
+                } },
+                  h("div", { className: d.is_active ? "green" : "", style: "width:48px;display:grid;place-items:center" }, deviceIcon(d.type)),
+                  h("div", { className: "grow" },
+                    h("div", { className: "t ellipsis" + (d.is_active ? " green" : "") }, d.name),
+                    h("div", { className: "s" }, d.is_active ? "Listening on this device" : d.type),
+                  ),
+                  d.is_active && h("span", { className: "green" }, icon("check")),
                 ),
-              ))
-            : h("p", { className: "muted" }, "No devices found. Open the Spotify app on your phone first."),
-          h("button", { className: "sec small", onClick: drawDevices }, "Refresh"),
+              )
+            : h("div", { className: "empty" }, icon("phone"), "No devices found. Open the Spotify app on your phone, then refresh."),
+          h("button", { className: "btn outline small", style: "margin-top:8px", onClick: drawDevices }, "Refresh"),
         );
       } catch (e) {
-        fill(devBox, h("div", { className: "error" }, e.message));
+        fill(devBox, h("div", { className: "err" }, e.message));
       }
     };
     drawDevices();
+
+    const exportTrims = async () => {
+      const text = JSON.stringify(trims);
+      try {
+        if (navigator.share) await navigator.share({ title: "Playlist Plus trims", text });
+        else {
+          await navigator.clipboard.writeText(text);
+          toast("Trims copied to clipboard");
+        }
+      } catch (e) {
+        if (e && e.name === "AbortError") return;
+        try {
+          await navigator.clipboard.writeText(text);
+          toast("Trims copied to clipboard");
+        } catch {
+          toast("Couldn't share or copy the trims.", true);
+        }
+      }
+    };
+    const importTrims = () => {
+      const area = h("textarea", { className: "field", placeholder: "Paste exported trims here" });
+      const close = openSheet(h("div", null,
+        h("h3", null, "Import trims"),
+        h("p", { className: "sub" }, "Paste trims exported from the desktop extension or another phone. They're merged with the ones you have."),
+        area,
+        h("div", { className: "spacer" }),
+        h("button", { className: "btn block", onClick: () => {
+          try {
+            const data = JSON.parse(area.value);
+            if (typeof data !== "object" || !data || Array.isArray(data)) throw new Error();
+            const n = Object.keys(data).length;
+            Object.assign(trims, data);
+            saveTrims();
+            toast(`Imported ${n} trim${n === 1 ? "" : "s"}`);
+            close();
+          } catch {
+            toast("That isn't valid trim data.", true);
+          }
+        } }, "Import"),
+      ));
+    };
+
     return h("div", null,
-      h("div", { className: "card" },
-        cb("trimsEnabled", "Apply song trims during normal listening"),
-        cb("trimsInSessions", "Apply song trims during timed sessions"),
-        h("div", { className: "row" },
-          h("span", null, "Fade out cut songs for"),
-          h("input", { type: "number", inputmode: "numeric", min: "0", max: "15", value: settings.fadeSeconds, onChange: (e) => ((settings.fadeSeconds = Math.max(0, Number(e.target.value) || 0)), saveSettings()) }),
-          h("span", null, "s"),
+      h("div", { className: "eyebrow" }, "Playlist Plus"),
+      h("h1", null, "Settings"),
+      h("h2", null, "Playback"),
+      switchSetting("trimsEnabled", "Trim songs while listening", "Applies your trims whenever this app is open."),
+      switchSetting("trimsInSessions", "Trim songs in timed sessions", null),
+      setting("Fade out cut songs", "When a phase ends mid-song. Works on computers and speakers; iPhones don't allow remote volume.",
+        h("div", { className: "stepper" },
+          h("button", { "aria-label": "Shorter", onClick: fadeStep(-1) }, icon("minus")),
+          fadeIn,
+          h("span", { className: "unit" }, "s"),
+          h("button", { "aria-label": "Longer", onClick: fadeStep(1) }, icon("plus")),
         ),
-        h("p", { className: "muted" }, "iPhones don't let apps change Spotify's volume remotely, so fading only works when Spotify plays on a computer or speaker."),
       ),
-      h("h2", null, "Play on"),
+      h("h2", null, "Devices"),
       devBox,
+      h("h2", null, "Backup"),
+      setting("Export trims", "Share or copy them, e.g. to the desktop extension.", icon("share"), exportTrims),
+      setting("Import trims", "Paste trims from another device.", icon("download"), importTrims),
       h("h2", null, "Account"),
-      h("div", { className: "row" },
-        h("button", { className: "sec small", onClick: logout }, "Log out"),
-        h("button", { className: "sec small", onClick: () => {
-          if (!confirm("Forget the Client ID and log out?")) return;
-          clientId = "";
-          localStorage.removeItem(KEY.clientId);
-          logout();
-        } }, "Change Client ID"),
+      setting("Log out", null, icon("logout"), logout),
+      setting("Change Client ID", "Use a different Spotify developer app.", icon("key"), async () => {
+        if (!(await confirmSheet("Change Client ID?", "You'll be logged out and asked for a new Client ID.", "Continue"))) return;
+        clientId = "";
+        localStorage.removeItem(KEY.clientId);
+        logout();
+      }),
+      h("details", { className: "more", style: "margin-top:16px" },
+        h("summary", null, icon("info"), "How it works", icon("chevronDown")),
+        h("p", { className: "sub" }, "Playlist Plus remote-controls Spotify through Spotify's official Web API. iOS pauses web apps in the background, so trims and exact phase timing need this app open. The screen stays awake during sessions. If the phone locks, Spotify keeps playing the planned songs in order, and the app catches up when you return."),
       ),
     );
   }
 
-  // ----- session lifecycle -------------------------------------------------------
+  // ----- session lifecycle --------------------------------------------------------------
   let runner = null;
   let wakeLock = null;
   const keepAwake = async () => {
@@ -878,28 +1338,32 @@
         if (type === "finish") {
           toast("Session complete 🎉");
           if (wakeLock) wakeLock.release();
+          if (tab === "session") renderTab();
         }
+        live.key = null;
         updateLive();
       },
     });
     lastTick = Date.now();
     runner.start();
     keepAwake();
-    toast(`Session started: ${phases[0].name}`);
+    toast(`Starting ${phases[0].name}`);
+    tab = "session";
+    render();
     window.scrollTo({ top: 0, behavior: "smooth" });
-    updateLive();
   }
 
-  function stopSession() {
+  async function stopSession(ask) {
     if (!runner) return;
+    if (ask && !(await confirmSheet("End this session?", "The music keeps playing; the timer stops.", "End session"))) return;
     runner.stop();
     runner = null;
     if (wakeLock) wakeLock.release();
-    updateLive();
-    toast("Session stopped");
+    toast("Session ended");
+    if (tab === "session") renderTab();
   }
 
-  // ----- main loop ---------------------------------------------------------------
+  // ----- main loop -------------------------------------------------------------------------
   const trimWatcher = new TrimWatcher(player, () => trims);
   let lastTick = Date.now();
   let lastLive = 0;
@@ -920,7 +1384,7 @@
     } catch (e) {
       console.error(e);
     }
-    if (now - lastLive > 500 && document.activeElement?.tagName !== "SELECT") {
+    if (now - lastLive > 250) {
       lastLive = now;
       updateLive();
     }
@@ -941,7 +1405,7 @@
     keepAwake();
   });
 
-  // ----- boot ----------------------------------------------------------------------
+  // ----- boot --------------------------------------------------------------------------------
   (async () => {
     try {
       await handleRedirect();
@@ -952,6 +1416,7 @@
     if (auth) {
       setInterval(tick, 200);
       pollLoop();
+      player.poll().then(updateLive);
     }
   })();
 })();
