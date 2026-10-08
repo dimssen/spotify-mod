@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <title>Playlist Plus</title>
   <meta name="description" content="Trim songs and run timed multi-phase playlists on Spotify.">
   <meta name="theme-color" content="#121212">
@@ -41,6 +41,10 @@
       --font: "Figtree", "Spotify Mix", "Circular", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    /* No zooming anywhere: no double-tap zoom (touch-action), no text inflation on rotate,
+       and every field is at least 16px so iOS doesn't zoom in when one is focused. */
+    html, body { touch-action: manipulation; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+    input, select, textarea { font-size: 16px; }
     html { background: var(--bg); }
     body {
       margin: 0; color: var(--text); background: var(--bg);
@@ -151,7 +155,7 @@
     .stepper button { width: 34px; height: 36px; display: grid; place-items: center; color: #fff; }
     .stepper button svg.i { width: 16px; height: 16px; }
     .stepper input {
-      width: 46px; text-align: center; background: transparent; border: 0; outline: 0; font-weight: 800; font-size: 15px;
+      width: 46px; text-align: center; background: transparent; border: 0; outline: 0; font-weight: 800; font-size: 16px;
       -moz-appearance: textfield;
     }
     .stepper input::-webkit-outer-spin-button, .stepper input::-webkit-inner-spin-button { -webkit-appearance: none; }
@@ -230,7 +234,7 @@
       box-shadow: inset 0 0 0 1px transparent; transition: box-shadow .15s;
     }
     .field:focus { box-shadow: inset 0 0 0 2px #fff; }
-    textarea.field { height: 140px; padding: 12px 14px; font: 13px/1.4 ui-monospace, monospace; resize: none; }
+    textarea.field { height: 140px; padding: 12px 14px; font: 16px/1.4 ui-monospace, monospace; resize: none; }
     .search { position: relative; }
     .search svg.i { position: absolute; left: 12px; top: 12px; color: var(--sub); }
     .search .field { padding-left: 44px; }

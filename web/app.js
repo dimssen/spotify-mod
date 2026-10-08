@@ -1810,6 +1810,19 @@
     syncer.now();
   });
 
+  // ----- no zoom ---------------------------------------------------------------------------
+  // iOS Safari ignores "user-scalable=no", so block its pinch gestures and two-finger moves
+  // directly. Double-tap zoom is turned off in CSS (touch-action: manipulation).
+  for (const ev of ["gesturestart", "gesturechange", "gestureend"]) document.addEventListener(ev, (e) => e.preventDefault(), { passive: false });
+  document.addEventListener("touchmove", (e) => e.touches.length > 1 && e.preventDefault(), { passive: false });
+  // Belt and braces for older iOS versions: swallow a second tap within 300 ms on non-controls.
+  let lastTouchEnd = 0;
+  document.addEventListener("touchend", (e) => {
+    const now = Date.now();
+    if (now - lastTouchEnd < 300 && !e.target.closest("button, a, input, select, textarea, label, [role=button]")) e.preventDefault();
+    lastTouchEnd = now;
+  }, { passive: false });
+
   // ----- boot --------------------------------------------------------------------------------
   (async () => {
     try {
