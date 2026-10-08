@@ -93,6 +93,79 @@ const PlaylistPlusCore = (() => {
   }
 
   /**
+   * Songs are told apart by title + artist, so the same song on a single and on an album
+   * (two different Spotify URIs) still counts as a repeat.
+   */
+  const songKey = (t) => (t.name && t.name !== t.uri ? `${t.name}|${t.artist || ""}`.toLowerCase().trim() : t.uri);
+
+  /** Session-wide memory of what's been planned, so nothing repeats across phases. */
+  const newMemory = () => ({ used: new Set(), history: [] });
+
+  /**
+   * Hands out songs like Spotify's shuffle: every song once before any song comes back.
+   * Songs already used anywhere in the session (memory) only come back when a playlist runs
+   * out, and then in a new shuffled cycle that holds back the most recently heard songs and
+   * never repeats a song back-to-back.
+   */
+  class SongCycler {
+    constructor(tracks, { shuffle = true, rng = Math.random, memory = newMemory() } = {}) {
+      const seen = new Set();
+      this.songs = [];
+      for (const t of tracks || []) {
+        if (!t || !t.uri || !(t.duration > 0)) continue;
+        const k = songKey(t);
+        if (seen.has(k)) continue; // same song listed twice
+        seen.add(k);
+        this.songs.push(t);
+      }
+      this.order = (list) => (shuffle ? shuffled(list, rng) : list.slice());
+      this.memory = memory;
+      this.pool = [];
+      this.refill();
+    }
+
+    get lastKey() {
+      const h = this.memory.history;
+      return h.length ? h[h.length - 1] : null;
+    }
+
+    /** Fill the pool: unheard songs first; once everything's been heard, a new cycle. */
+    refill() {
+      const fresh = this.songs.filter((t) => !this.memory.used.has(songKey(t)));
+      if (fresh.length) {
+        this.pool = this.order(fresh);
+        return;
+      }
+      this.pool = this.nextCycle();
+    }
+
+    /** A new cycle (for when every song has been heard): the most recently heard songs go last. */
+    nextCycle() {
+      const hold = Math.min(Math.floor(this.songs.length / 2), 10);
+      const recent = this.memory.history.slice(-hold);
+      const rest = this.songs.filter((t) => !recent.includes(songKey(t)));
+      const held = recent.map((k) => this.songs.find((t) => songKey(t) === k)).filter(Boolean);
+      return [...this.order(rest), ...held];
+    }
+
+    /** Songs that may come next (never the one just played, unless there's nothing else). */
+    candidates() {
+      if (!this.pool.length) this.refill();
+      const c = this.pool.filter((t) => songKey(t) !== this.lastKey);
+      return c.length ? c : this.pool;
+    }
+
+    take(t) {
+      const i = this.pool.indexOf(t);
+      if (i >= 0) this.pool.splice(i, 1);
+      const k = songKey(t);
+      this.memory.used.add(k);
+      this.memory.history.push(k);
+      if (!this.pool.length) this.refill();
+    }
+  }
+
+  /**
    * Pick tracks from `tracks` until their (trimmed) length covers `budgetMs`.
    * The last track usually runs past the budget; it plays to its end.
    * smartFit: prefer tracks that still fit entirely in the remaining time, and avoid leaving
@@ -105,20 +178,21 @@ const PlaylistPlusCore = (() => {
   const EXACT_SLACK = 15000;
 
   function planPhase(tracks, budgetMs, opts = {}) {
-    const { shuffle = true, smartFit = true, rng = Math.random, trims = {}, prevUri = null, slack = 0 } = opts;
-    const usable = tracks.filter((t) => t && t.uri && t.duration > 0);
+    const { shuffle = true, smartFit = true, rng = Math.random, trims = {}, slack = 0 } = opts;
+    const memory = opts.memory || newMemory();
+    if (opts.prevUri && !memory.history.length) memory.history.push(opts.prevUri);
+    const cycler = new SongCycler(tracks, { shuffle, rng, memory });
+    const usable = cycler.songs;
     if (!usable.length || !(budgetMs > 0)) return [];
     const items = [];
     let acc = 0;
-    let pool = [];
-    let last = prevUri;
     for (let guard = 0; (items.length === 0 || acc < budgetMs - slack) && guard < 10000; guard++) {
-      if (!pool.length) pool = shuffle ? shuffled(usable, rng) : usable.slice();
+      const pool = cycler.candidates();
       const remaining = budgetMs - acc;
       const len = (t) => trackBounds(t, trims).length;
       let idx = -1;
       if (smartFit) {
-        const ok = (t) => t.uri !== last;
+        const ok = () => true;
         // A gap is fine if it's (almost) zero, or long enough for some other song to either
         // fill it cleanly or be cut after playing a decent part of it.
         const cleanGap = (gap) => gap < 1000 || gap >= MIN_TAIL;
@@ -131,13 +205,12 @@ const PlaylistPlusCore = (() => {
         if (idx < 0) idx = pool.findIndex((t) => ok(t) && len(t) > remaining);
         if (idx < 0) idx = pool.findIndex((t) => ok(t) && len(t) <= remaining && cleanGap(remaining - len(t)));
       }
-      if (idx < 0) idx = pool.findIndex((t) => t.uri !== last);
       if (idx < 0) idx = 0;
-      const t = pool.splice(idx, 1)[0];
+      const t = pool[idx];
+      cycler.take(t);
       const it = makeItem(t, trims);
       items.push(it);
       acc += it.length;
-      last = t.uri;
     }
     return items;
   }
@@ -154,9 +227,12 @@ const PlaylistPlusCore = (() => {
    * phone can stay locked.
    */
   function planPhaseSmooth(tracks, targetMs, opts = {}) {
-    const { shuffle = true, rng = Math.random, trims = {}, prevUri = null } = opts;
+    const { shuffle = true, rng = Math.random, trims = {} } = opts;
     const tolerance = opts.tolerance ?? Math.max(15000, Math.min(60000, targetMs * 0.12));
-    const usable = tracks.filter((t) => t && t.uri && t.duration > 0);
+    const memory = opts.memory || newMemory();
+    if (opts.prevUri && !memory.history.length) memory.history.push(opts.prevUri);
+    const cycler = new SongCycler(tracks, { shuffle, rng, memory });
+    const usable = cycler.songs;
     if (!usable.length || !(targetMs > 0)) return [];
     const len = (t) => trackBounds(t, trims).length;
     const lens = usable.map(len).sort((a, b) => a - b);
@@ -164,25 +240,25 @@ const PlaylistPlusCore = (() => {
     const typical = lens[Math.floor(lens.length / 2)];
     const items = [];
     let acc = 0;
-    let pool = [];
-    let last = prevUri;
     const take = (t) => {
-      const i = pool.indexOf(t);
-      if (i >= 0) pool.splice(i, 1);
+      cycler.take(t);
       items.push(makeItem(t, trims));
       acc += len(t);
-      last = t.uri;
     };
-    const candidates = () => {
-      const used = new Set(items.map((i) => i.uri));
-      let c = pool.filter((t) => t.uri !== last);
-      if (c.length < 12) c = c.concat(usable.filter((t) => t.uri !== last && !used.has(t.uri) && !c.includes(t)));
-      if (!c.length) c = usable.filter((t) => t.uri !== last);
-      return (c.length ? c : usable).slice(0, 250);
+    // Songs not heard yet in the session. Only if those can't fill the time left do songs
+    // from a new cycle (repeats, never the most recent ones) become options.
+    const candidates = (R = Infinity) => {
+      let c = cycler.candidates();
+      const total = c.reduce((a, t) => a + len(t), 0);
+      if (total < R - tolerance) {
+        const last = cycler.lastKey;
+        c = c.concat(cycler.nextCycle().filter((t) => !c.includes(t) && songKey(t) !== last));
+      }
+      return c.slice(0, 250);
     };
     // Best way to finish from here: stop now, or one, two or (small playlists) three more songs.
     const bestFinish = (R) => {
-      const c = candidates();
+      const c = candidates(R);
       let best = { err: Math.abs(R), picks: [] };
       for (const t of c) {
         const e = Math.abs(R - len(t));
@@ -193,7 +269,7 @@ const PlaylistPlusCore = (() => {
           const li = len(c[i]);
           if (li >= R) continue;
           for (let j = 0; j < c.length; j++) {
-            if (i === j || c[i].uri === c[j].uri) continue;
+            if (i === j || songKey(c[i]) === songKey(c[j])) continue;
             const e = Math.abs(R - li - len(c[j]));
             if (e < best.err) best = { err: e, picks: [c[i], c[j]] };
           }
@@ -203,9 +279,9 @@ const PlaylistPlusCore = (() => {
         for (let i = 0; i < c.length; i++) {
           for (let j = i + 1; j < c.length; j++) {
             const lij = len(c[i]) + len(c[j]);
-            if (lij >= R || c[i].uri === c[j].uri) continue;
+            if (lij >= R || songKey(c[i]) === songKey(c[j])) continue;
             for (let k = j + 1; k < c.length; k++) {
-              if (c[k].uri === c[i].uri || c[k].uri === c[j].uri) continue;
+              if (songKey(c[k]) === songKey(c[i]) || songKey(c[k]) === songKey(c[j])) continue;
               const e = Math.abs(R - lij - len(c[k]));
               if (e < best.err) best = { err: e, picks: [c[i], c[k], c[j]] };
             }
@@ -215,7 +291,6 @@ const PlaylistPlusCore = (() => {
       return best;
     };
     for (let guard = 0; guard < 10000; guard++) {
-      if (!pool.length) pool = shuffle ? shuffled(usable, rng) : usable.slice();
       const R = targetMs - acc;
       if (R <= 0) break;
       if (R <= (usable.length <= 40 ? 3 : 2) * typical + tolerance) {
@@ -225,7 +300,7 @@ const PlaylistPlusCore = (() => {
           break;
         }
         // No good ending yet: add a song that leaves room for at least one more, then retry.
-        const room = candidates().find((t) => len(t) <= R - minLen);
+        const room = candidates(R).find((t) => len(t) <= R - minLen);
         if (!room) {
           best.picks.forEach(take);
           break;
@@ -233,7 +308,7 @@ const PlaylistPlusCore = (() => {
         take(room);
         continue;
       }
-      take(pool.find((t) => t.uri !== last) || pool[0]);
+      take(cycler.candidates()[0]);
     }
     return items;
   }
@@ -278,11 +353,11 @@ const PlaylistPlusCore = (() => {
     let target = 0;
     let planned = 0;
     let overrun = 0; // exact: how far the previous phase's last song runs past its time
+    const memory = newMemory(); // no song repeats anywhere in the session (until playlists run out)
     for (const def of phaseDefs) {
       target += def.budget;
       if (!(def.budget > 0)) continue;
-      const prev = phases.length ? phases[phases.length - 1].items.slice(-1)[0] : null;
-      const base = { shuffle, smartFit, trims, rng, prevUri: prev && prev.uri };
+      const base = { shuffle, smartFit, trims, rng, memory };
       let items;
       let budget;
       if (mode === "smooth") {
@@ -311,13 +386,20 @@ const PlaylistPlusCore = (() => {
   function afterSessionQueue(phases, { shuffle = true, rng = Math.random, max = 80 } = {}) {
     const last = phases[phases.length - 1];
     if (!last || !last.pool) return [];
-    const played = new Set(phases.flatMap((p) => p.items.map((i) => i.uri)));
-    const pool = last.pool.filter((t) => t && t.uri && t.duration > 0);
-    const fresh = pool.filter((t) => !played.has(t.uri));
-    const again = pool.filter((t) => played.has(t.uri));
-    const order = shuffle ? [...shuffled(fresh, rng), ...shuffled(again, rng)] : [...fresh, ...again];
-    const lastUri = last.items.length ? last.items[last.items.length - 1].uri : null;
-    return order.map((t) => t.uri).filter((u) => u !== lastUri).slice(0, max);
+    // Continue the session's shuffle: songs not heard yet first, then a new cycle that
+    // holds back the most recently heard ones.
+    const memory = newMemory();
+    for (const p of phases) for (const i of p.items) (memory.used.add(songKey(i)), memory.history.push(songKey(i)));
+    const cycler = new SongCycler(last.pool, { shuffle, rng, memory });
+    const out = [];
+    const guard = Math.min(max, cycler.songs.length * 3);
+    while (out.length < guard && cycler.songs.length) {
+      const t = cycler.candidates()[0];
+      if (!t) break;
+      cycler.take(t);
+      out.push(t.uri);
+    }
+    return out;
   }
 
   /**
@@ -545,6 +627,13 @@ const PlaylistPlusCore = (() => {
       return n ? this.phases[n.pi].items[n.i].uri : this._afterUris()[0] || null;
     }
 
+    /** Everything planned so far in the session, so extra songs don't repeat any of it. */
+    _memory() {
+      const m = newMemory();
+      for (const p of this.phases) for (const i of p.items) (m.used.add(songKey(i)), m.history.push(songKey(i)));
+      return m;
+    }
+
     _afterUris() {
       return (this.opts.after && this.opts.after.uris) || [];
     }
@@ -552,9 +641,8 @@ const PlaylistPlusCore = (() => {
     _goTo(target) {
       if (target.extend) {
         // Exact mode ran out of planned songs before the phase's time (songs were skipped).
-        const prev = this.phase.items[this.phase.items.length - 1];
         const left = Math.max(1000, this.phase.budget - this.phaseElapsed);
-        const more = planPhase(this.phase.pool || [], left, { ...this.opts, prevUri: prev && prev.uri, slack: EXACT_SLACK });
+        const more = planPhase(this.phase.pool || [], left, { ...this.opts, memory: this._memory(), slack: EXACT_SLACK });
         if (!more.length) return this._nextPhase();
         this.phase.items.push(...more);
       }
@@ -678,8 +766,7 @@ const PlaylistPlusCore = (() => {
         // Exact mode: ran out of planned songs (the user skipped some), so plan more for the
         // time left. Smooth mode: the phase simply ends early.
         const left = this.phase.budget - this.phaseElapsed;
-        const prev = this.phase.items[this.phase.items.length - 1];
-        const more = !this.opts.smooth && left > 1000 ? planPhase(this.phase.pool, left, { ...this.opts, prevUri: prev && prev.uri }) : [];
+        const more = !this.opts.smooth && left > 1000 ? planPhase(this.phase.pool, left, { ...this.opts, memory: this._memory() }) : [];
         if (!more.length) {
           this._nextPhase();
           return;
@@ -1118,7 +1205,7 @@ const PlaylistPlusCore = (() => {
   const PHASE_COLORS = ["#e13300", "#8d67ab", "#509bf5", "#e8115b", "#27856a", "#ba5d07", "#477d95", "#148a08"];
   const phaseColor = (i) => PHASE_COLORS[i % PHASE_COLORS.length];
 
-  return { parseTime, formatTime, normalizePlaylistUri, computeBudgets, trackBounds, shuffled, planPhase, SessionRunner, TrimWatcher, phaseColor, ICONS, planPhaseSmooth, planSession, afterSessionQueue, mergeDocs, stableStringify, SyncStore, createGistClient, syncOnce, createSyncer };
+  return { parseTime, formatTime, normalizePlaylistUri, computeBudgets, trackBounds, shuffled, planPhase, SessionRunner, TrimWatcher, phaseColor, ICONS, planPhaseSmooth, planSession, afterSessionQueue, songKey, mergeDocs, stableStringify, SyncStore, createGistClient, syncOnce, createSyncer };
 })();
 
 if (typeof module !== "undefined" && module.exports) module.exports = PlaylistPlusCore;

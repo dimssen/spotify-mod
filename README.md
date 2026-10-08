@@ -112,6 +112,7 @@ While a session runs, a card above the player shows the current phase, a countdo
 
 Notes:
 - The session timer counts listening time only. It pauses when the music pauses.
+- **No repeats**, like Spotify's shuffle: no song plays twice in a session, even if phases share a playlist or a song appears twice (or as both a single and an album track). Only when a phase needs more time than its playlist has does a song come back, in a fresh shuffle that holds back the songs you heard most recently. The music after the session follows the same rule.
 - **Smart fit** (the pulse icon) picks songs that finish before the phase's time is up when it can, so phases don't run over by much. **Shuffle** (the shuffle icon) mixes each phase's playlist.
 - Trims apply inside sessions too. Settings lets you turn that off, change the fade length, or turn trims off entirely.
 - If you skip a song or start something else in Spotify, the session plays its next planned song. Press **Stop** to leave a session.

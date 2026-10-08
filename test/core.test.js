@@ -506,7 +506,8 @@ test("msUntilAction: sleeps through natural song changes, wakes before trims and
   const trims = { "spotify:track:t1": { start: 0, end: 60000 } };
   const p2 = queueingPlayer(Object.fromEntries(tracks.map((t) => [t.uri, t.duration])));
   p2.leadMs = 300;
-  const plan2 = planSession([{ name: "A", pool: tracks, budget: 5 * MIN }], { mode: "smooth", shuffle: false, trims });
+  // 1:00 (trimmed) + 1:40 + 1:40 = 4:20, so the phase needs no repeats.
+  const plan2 = planSession([{ name: "A", pool: tracks, budget: 260000 }], { mode: "smooth", shuffle: false, trims });
   const r2 = new SessionRunner(p2, plan2, { smooth: true, trims });
   r2.start();
   r2.tick(200);
@@ -559,4 +560,66 @@ test("without keep-playing, the session pauses at the end", () => {
   simulate(r, p, 3 * MIN);
   assert.equal(r.active, false);
   assert.equal(p.playing, false);
+});
+
+// --- no repeats, like Spotify's shuffle ------------------------------------------------------
+const { songKey } = core;
+const named = (n, secs, name = `Song ${n}`, artist = "Artist") => ({ uri: `spotify:track:x${n}`, name, artist, duration: secs * 1000 });
+const keysOf = (phases) => phases.flatMap((p) => p.items.map((i) => songKey(i)));
+
+test("no song repeats across phases, even when phases share a playlist", () => {
+  for (const mode of ["smooth", "exact"]) {
+    for (let seed = 1; seed <= 15; seed++) {
+      const rng = lcg(seed);
+      const shared = Array.from({ length: 40 }, (_, i) => named(i, 150 + Math.floor(rng() * 120)));
+      const phases = planSession(
+        [{ name: "Warm-up", pool: shared, budget: 10 * MIN }, { name: "Normal", pool: shared, budget: 30 * MIN }, { name: "Cool-down", pool: shared, budget: 10 * MIN }],
+        { mode, rng },
+      );
+      const keys = keysOf(phases);
+      assert.equal(new Set(keys).size, keys.length, `${mode} seed ${seed}: a song repeated`);
+    }
+  }
+});
+
+test("the same song under two URIs, or listed twice, counts as one", () => {
+  const pool = [
+    named(1, 200, "Hit Song", "Band"),
+    { ...named(2, 201, "Hit Song", "Band") }, // same song from the album
+    named(3, 180),
+    named(1, 200, "Hit Song", "Band"), // listed twice in the playlist
+    named(4, 190),
+    named(5, 210),
+  ];
+  for (let seed = 1; seed <= 20; seed++) {
+    const phases = planSession([{ name: "A", pool, budget: 13 * MIN }], { mode: "smooth", rng: lcg(seed) });
+    const keys = keysOf(phases);
+    assert.equal(keys.filter((k) => k === "hit song|band").length, 1, `seed ${seed}: ${keys}`);
+  }
+});
+
+test("short playlists cycle like shuffle+repeat: everything once before any repeat, never back-to-back", () => {
+  const pool = Array.from({ length: 5 }, (_, i) => named(i, 180));
+  for (const mode of ["smooth", "exact"]) {
+    for (let seed = 1; seed <= 15; seed++) {
+      const phases = planSession([{ name: "A", pool, budget: 40 * MIN }], { mode, rng: lcg(seed) });
+      const keys = keysOf(phases);
+      assert.equal(new Set(keys.slice(0, 5)).size, 5, `${mode} seed ${seed}: repeated before playing all: ${keys}`);
+      for (let i = 1; i < keys.length; i++) assert.notEqual(keys[i], keys[i - 1], `${mode} seed ${seed}: back-to-back repeat`);
+      // A repeated song only comes back after at least two others.
+      for (let i = 2; i < keys.length; i++) assert.notEqual(keys[i], keys[i - 2], `${mode} seed ${seed}: repeat too soon: ${keys}`);
+    }
+  }
+});
+
+test("after the session: no song you just heard, no duplicates", () => {
+  const last = Array.from({ length: 12 }, (_, i) => named(i, 180));
+  const phases = planSession([{ name: "A", pool: last.slice(0, 6), budget: 9 * MIN }, { name: "B", pool: last, budget: 9 * MIN }], { mode: "smooth", rng: lcg(3) });
+  const heard = new Set(keysOf(phases));
+  const after = afterSessionQueue(phases, { rng: lcg(4) });
+  const afterKeys = after.map((u) => songKey(last.find((t) => t.uri === u)));
+  const fresh = last.filter((t) => !heard.has(songKey(t))).length;
+  assert.ok(fresh > 0);
+  assert.ok(afterKeys.slice(0, fresh).every((k) => !heard.has(k)), "unheard songs first");
+  assert.equal(new Set(afterKeys.slice(0, last.length)).size, Math.min(last.length, afterKeys.length), "each song once per cycle");
 });
