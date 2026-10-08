@@ -481,6 +481,52 @@ const PlaylistPlusCore = (() => {
       if (!p.playsUpcoming && trackLeft <= lead) this._advanceTrack();
     }
 
+    /**
+     * How long until the runner next has to do something itself (cut at a trim end, hand
+     * over to a song with a trimmed start, a fade, an exact phase cut, stopping at the end).
+     * Natural song changes need no action; we just check in after the song. Lets the app
+     * sleep (poll less, redraw less) in between, to save battery.
+     */
+    msUntilAction() {
+      if (!this.active) return Infinity;
+      if (this.switching) return 0;
+      const p = this.player;
+      if (!p.isPlaying()) return Infinity;
+      const item = this.item;
+      const trackLeft = item.end - p.progress();
+      const lead = this.lead;
+      const xf = this.opts.crossfadeMs || 0;
+      const next = this._peekNext();
+      const trimmedEnd = item.duration && item.end < item.duration - 500;
+      const canFade = this.opts.fadeMs > 0 && p.getVolume() != null;
+      let cut = trimmedEnd ? trackLeft : Infinity;
+      if (!this.opts.smooth) cut = Math.min(cut, this.phaseLeft());
+      let t = cut - lead - (canFade && cut < Infinity ? this.opts.fadeMs : 0);
+      if (!next) t = Math.min(t, trackLeft - lead - xf);
+      else if (next.start > 0) t = Math.min(t, trackLeft - lead - (trimmedEnd ? 0 : xf));
+      if (!p.playsUpcoming) t = Math.min(t, trackLeft - lead);
+      if (t === Infinity) t = trackLeft + 1000; // a natural song change: catch up afterwards
+      return Math.max(0, t);
+    }
+
+    /**
+     * Whether the rest of the session needs the app at all. A smooth session whose remaining
+     * songs have no trims plays entirely by itself in Spotify, so the phone can lock.
+     */
+    needsApp() {
+      if (!this.active) return false;
+      if (!this.opts.smooth) return true;
+      for (let pi = this.phaseIdx; pi < this.phases.length; pi++) {
+        const items = this.phases[pi].items;
+        for (let i = pi === this.phaseIdx ? this.itemIdx : 0; i < items.length; i++) {
+          const it = items[i];
+          const trimmedStart = it.start > 0 && !(pi === this.phaseIdx && i === this.itemIdx);
+          if (trimmedStart || (it.duration && it.end < it.duration - 500)) return true;
+        }
+      }
+      return false;
+    }
+
     _peekNext() {
       const items = this.phase.items;
       if (this.itemIdx + 1 < items.length) return items[this.itemIdx + 1];
@@ -965,6 +1011,8 @@ const PlaylistPlusCore = (() => {
     copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
     list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
     info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5h.01"/>',
+    moon: '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>',
+    lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
   };
 
   // Phase colours, in the spirit of Spotify's browse cards.

@@ -292,6 +292,15 @@
     .action.danger { color: var(--red); }
     .action.danger svg.i { color: var(--red); }
 
+    /* --- battery saver: pitch-black pocket screen (OLED pixels off) ------------ */
+    #pocket { display: none; position: fixed; inset: 0; z-index: 200; background: #000; cursor: pointer; }
+    #pocket .pk { position: absolute; color: #3a3a3a; font-size: 20px; font-weight: 800; letter-spacing: -.02em; max-width: 70%; }
+    #pocket .pk small { display: block; margin-top: 6px; color: #262626; font-size: 13px; font-weight: 600; letter-spacing: 0; }
+    html:has(body.pocket), body.pocket { background: #000; }
+    body.pocket #pocket { display: block; }
+    body.pocket #app, body.pocket #hero, body.pocket #toast { display: none !important; }
+    .note .btn { flex: none; align-self: center; }
+
     /* --- toast -------------------------------------------------------------- */
     #toast {
       position: fixed; left: 12px; right: 12px; z-index: 60; max-width: 616px; margin: 0 auto;

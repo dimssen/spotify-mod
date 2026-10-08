@@ -472,3 +472,40 @@ test("SyncStore keeps object identity when remote changes arrive", () => {
   assert.equal(remoteEvents, 1);
   assert.equal(store.apply(store.doc()), false, "no change, no event");
 });
+
+// --- battery: knowing when the app is needed ---------------------------------------------
+test("msUntilAction: sleeps through natural song changes, wakes before trims and cuts", () => {
+  const tracks = [track(1, 100), track(2, 100), track(3, 100)];
+  const p = queueingPlayer(Object.fromEntries(tracks.map((t) => [t.uri, t.duration])));
+  p.leadMs = 300;
+  // Smooth, no trims: next action is only "check in after the song".
+  const plain = planSession([{ name: "A", pool: tracks, budget: 5 * MIN }], { mode: "smooth", shuffle: false });
+  const r = new SessionRunner(p, plain, { smooth: true });
+  r.start();
+  r.tick(200);
+  assert.ok(r.msUntilAction() > 99000, `natural change: ${r.msUntilAction()}`);
+  assert.equal(r.needsApp(), false, "plays on its own: the phone can lock");
+
+  // A trimmed end on the current song: wake just before it (lead + no fade on iPhone).
+  const trims = { "spotify:track:t1": { start: 0, end: 60000 } };
+  const p2 = queueingPlayer(Object.fromEntries(tracks.map((t) => [t.uri, t.duration])));
+  p2.leadMs = 300;
+  const plan2 = planSession([{ name: "A", pool: tracks, budget: 5 * MIN }], { mode: "smooth", shuffle: false, trims });
+  const r2 = new SessionRunner(p2, plan2, { smooth: true, trims });
+  r2.start();
+  r2.tick(200);
+  assert.ok(Math.abs(r2.msUntilAction() - (60000 - 300)) < 500, `trim end: ${r2.msUntilAction()}`);
+  assert.equal(r2.needsApp(), true);
+  simulate(r2, p2, 61000); // past the trim
+  assert.equal(r2.needsApp(), false, "no trims left: the app can rest");
+
+  // Exact mode always needs the app; the phase cut is the next action.
+  const p3 = queueingPlayer({ "spotify:track:t9": 600000 });
+  p3.leadMs = 300;
+  const t9 = [track(9, 600)];
+  const r3 = new SessionRunner(p3, [{ name: "A", budget: MIN, pool: t9, items: planPhase(t9, MIN) }], {});
+  r3.start();
+  r3.tick(200);
+  assert.ok(r3.msUntilAction() < MIN && r3.msUntilAction() > MIN - 5000, `exact cut: ${r3.msUntilAction()}`);
+  assert.equal(r3.needsApp(), true);
+});

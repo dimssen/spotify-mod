@@ -34,7 +34,7 @@
     }
   };
 
-  let settings = { trimsEnabled: true, trimsInSessions: true, fadeSeconds: 3, crossfadeSeconds: 0, ...load(KEY.settings, {}) };
+  let settings = { trimsEnabled: true, trimsInSessions: true, fadeSeconds: 3, crossfadeSeconds: 0, powerSaver: true, ...load(KEY.settings, {}) };
   // The built-in template has a fixed id, so it's the same template on every synced device.
   const defaultTemplate = (id = "default-workout") => ({
     id,
@@ -241,8 +241,10 @@
     isPlaying() {
       return !!(this.state && this.state.playing);
     },
+    // Polls can be far apart when saving battery; the position is extrapolated in between.
+    pollEvery: 1000,
     fresh() {
-      return Date.now() - this.fetchedAt < 3000;
+      return this.fetchedAt > 0 && Date.now() - this.fetchedAt < this.pollEvery + 3000;
     },
     deviceQuery() {
       const id = (this.state && this.state.device && this.state.device.id) || this.chosenDevice;
@@ -1048,6 +1050,7 @@
           h("button", { className: "icon-btn", "aria-label": "Next phase", disabled: !nextPhase, onClick: () => runner.skipPhase() }, icon("forward")),
         ),
         nextPhase && h("div", { style: "text-align:center;margin-top:4px" }, (r.nextLabel = h("span", { className: "tiny tnum" }))),
+        (r.appNote = h("div", { className: "note", style: "margin-top:18px" })),
         upcoming.length > 0 && h("h2", null, "Next in queue"),
         h("div", { className: "list" }, upcoming.map((u) =>
           h("div", { className: "item" },
@@ -1064,6 +1067,18 @@
     const r = live.refs;
     r.countdown.textContent = formatTime(st.phaseLeft);
     r.sub.textContent = `left in ${st.phaseName} · ${formatTime(st.totalLeft)} left in session`;
+    const needed = runner.needsApp();
+    if (r.appNote.dataset.needed !== String(needed)) {
+      r.appNote.dataset.needed = String(needed);
+      r.appNote.className = "note" + (needed ? "" : " good");
+      fill(r.appNote,
+        icon(needed ? "moon" : "lock"),
+        h("div", { className: "grow" }, needed
+          ? "Keep Playlist Plus open for the trimmed songs. To save battery, the screen goes black after 20 s; tap to wake."
+          : "Nothing left for the app to do: Spotify plays the rest on its own. Lock your phone any time."),
+        needed && h("button", { className: "btn outline small", onClick: enterPocket }, "Black screen"),
+      );
+    }
     if (r.nextLabel) {
       const np = runner.phases[st.phaseIdx + 1];
       const lastSong = runner.opts.smooth && runner.itemIdx === runner.phase.items.length - 1;
@@ -1382,6 +1397,7 @@
       h("h2", null, "Playback"),
       switchSetting("trimsEnabled", "Trim songs while listening", "Applies your trims whenever this app is open."),
       switchSetting("trimsInSessions", "Trim songs in timed sessions", null),
+      switchSetting("powerSaver", "Battery saver", "During sessions: the screen goes black after 20 s without a touch (tap to wake), Spotify is checked only when something's about to happen, and the phone may lock when the app has nothing left to do."),
       setting("Crossfade in Spotify", "Set the same value as Spotify → Settings → Playback → Crossfade. Sessions then end cleanly, and trimmed songs hand over at the right moment.",
         h("div", { className: "stepper" },
           h("button", { "aria-label": "Shorter", onClick: () => ((settings.crossfadeSeconds = Math.max(0, settings.crossfadeSeconds - 1)), saveSettings(), (xfIn.value = settings.crossfadeSeconds)) }, icon("minus")),
@@ -1517,7 +1533,7 @@
   let wakeLock = null;
   const keepAwake = async () => {
     try {
-      if (runner && runner.active && navigator.wakeLock && !wakeLock) {
+      if (runner && runner.active && runner.needsApp() && navigator.wakeLock && !wakeLock) {
         wakeLock = await navigator.wakeLock.request("screen");
         wakeLock.addEventListener("release", () => (wakeLock = null));
       }
@@ -1533,6 +1549,7 @@
     onEvent: (type, r) => {
       if (type === "phase") toast(`Now: ${r.phase.name}`);
       if (type === "finish") {
+        exitPocket();
         toast("Session complete 🎉");
         clearSession();
         if (wakeLock) wakeLock.release();
@@ -1653,6 +1670,7 @@
     if (ask && !(await confirmSheet("End this session?", "The music keeps playing; the timer stops.", "End session"))) return;
     runner.stop();
     runner = null;
+    exitPocket();
     clearSession();
     if (wakeLock) wakeLock.release();
     toast("Session ended");
@@ -1680,7 +1698,9 @@
     } catch (e) {
       console.error(e);
     }
-    if (now - lastLive > 250) {
+    if (powerSaving) {
+      if (now - lastPocketDraw > 15000) drawPocket();
+    } else if (now - lastLive > 250) {
       lastLive = now;
       updateLive();
     }
@@ -1688,29 +1708,97 @@
       lastSaved = now;
       saveSession();
     }
+    if (now - lastPowerCheck > 2000) {
+      lastPowerCheck = now;
+      powerCheck(now);
+    }
   }
   let lastSaved = 0;
+  let lastPowerCheck = 0;
 
-  // Poll faster when something is about to happen (a cut, a hand-over, a trim), so it lands on time.
+  // When will something happen that needs us on time (a trim, a hand-over, a cut)?
   function msToNextAction() {
     const s = player.state;
     if (!s || !s.playing) return Infinity;
+    if (runner && runner.active) return runner.msUntilAction();
     const pos = player.progress();
-    if (runner && runner.active) {
-      const item = runner.item;
-      return item ? Math.min(item.end - pos, runner.opts.smooth ? Infinity : runner.phaseLeft()) : Infinity;
-    }
     // Outside sessions: a trim end coming up, or a song ending (the next one may have a trimmed start).
     const t = settings.trimsEnabled && trims[s.uri];
     return Math.min(t && t.end ? t.end - pos : Infinity, s.duration ? s.duration - pos : Infinity);
   }
 
+  // ----- battery saving -----------------------------------------------------------------------
+  // The screen is the biggest drain, then network and redraws. So: let the phone lock when the
+  // session doesn't need the app, go pitch black (OLED pixels off) when it does, and only poll
+  // and redraw often right before something has to happen.
+  let powerSaving = false;
+  let lastInteraction = Date.now();
+  let lastPocketDraw = 0;
+  const pocketText = h("div", { className: "pk" });
+  const pocket = h("div", { id: "pocket", role: "button", "aria-label": "Tap to wake", onClick: () => exitPocket() }, pocketText);
+  document.body.append(pocket);
+  ["pointerdown", "keydown", "scroll"].forEach((ev) => document.addEventListener(ev, () => (lastInteraction = Date.now()), { passive: true, capture: true }));
+
+  function enterPocket() {
+    if (powerSaving) return;
+    powerSaving = true;
+    document.body.classList.add("pocket");
+    drawPocket();
+  }
+  function exitPocket() {
+    if (!powerSaving) return;
+    powerSaving = false;
+    lastInteraction = Date.now();
+    document.body.classList.remove("pocket");
+    live.key = null;
+    updateLive();
+  }
+  function drawPocket() {
+    lastPocketDraw = Date.now();
+    const st = runner && runner.status();
+    fill(pocketText,
+      st ? `${st.phaseName} · ${Math.max(1, Math.ceil(st.phaseLeft / 60000))} min left` : "Playlist Plus",
+      h("small", null, runner && runner.active && !runner.needsApp() ? "Nothing left for the app to do: lock your phone any time" : "Tap to wake"),
+    );
+    // Move the text now and then so nothing burns in.
+    pocketText.style.top = `${15 + Math.random() * 60}%`;
+    pocketText.style.left = `${8 + Math.random() * 30}%`;
+  }
+  function powerCheck(now) {
+    const sessionOn = runner && runner.active;
+    // Keep the screen on only while the session still needs the app; otherwise let iOS lock it.
+    if (sessionOn && runner.needsApp()) keepAwake();
+    else if (wakeLock) wakeLock.release();
+    if (!settings.powerSaver) return;
+    if (sessionOn && !powerSaving && now - lastInteraction > 20000 && !document.querySelector(".sheet-wrap")) enterPocket();
+    if (!sessionOn && powerSaving) exitPocket();
+  }
+
+  // Tick fast only right before an action; otherwise a few times a second (or once a second
+  // on the black screen).
+  function nextTickDelay() {
+    if (document.hidden) return 1000;
+    if (msToNextAction() < 3000) return 100;
+    return powerSaving ? 1000 : 250;
+  }
+  function nextPollDelay() {
+    const ms = msToNextAction();
+    if (ms < 8000) return 400;
+    const sessionOn = runner && runner.active;
+    if (settings.powerSaver && sessionOn) return Math.max(1500, Math.min(ms - 6000, powerSaving ? 20000 : 5000));
+    const busy = sessionOn || (settings.trimsEnabled && Object.keys(trims).length);
+    return busy ? 1000 : 3000;
+  }
+  function tickLoop() {
+    tick();
+    setTimeout(tickLoop, nextTickDelay());
+  }
+
   async function pollLoop() {
     for (;;) {
       if (auth && !document.hidden) await player.poll();
-      const busy = (runner && runner.active) || (settings.trimsEnabled && Object.keys(trims).length);
-      const soon = msToNextAction() < 8000;
-      await new Promise((r) => setTimeout(r, soon ? 400 : busy ? 1000 : 3000));
+      player.pollEvery = nextPollDelay();
+      await new Promise((r) => setTimeout(r, player.pollEvery));
     }
   }
 
@@ -1732,7 +1820,7 @@
     render();
     syncer.start();
     if (auth) {
-      setInterval(tick, 100);
+      tickLoop();
       pollLoop();
       await player.poll();
       updateLive();

@@ -45,6 +45,14 @@ iPhones don't let apps change Spotify's volume, and Spotify's crossfade only app
 
 **Exact** transitions are still there if you want phases to change on the dot, but on an iPhone that means a hard cut, and the app must stay open.
 
+### Battery saver (on by default)
+
+- **The phone can lock when the app isn't needed.** In a Smooth session with no trimmed songs left, Spotify does everything itself, so the app stops keeping the screen on and your phone locks as usual. The session screen tells you when this is the case.
+- **Black screen when the app is needed.** If trims or Exact timing need the app, the screen turns pitch black after 20 seconds without a touch, showing only a dim phase and minutes-left line. On iPhones with OLED screens (iPhone X and later, except the XR and 11) black pixels are switched off, so this uses very little power. Tap to wake. You can also tap **Black screen** on the session screen.
+- **Quiet in between.** The app works out when it next has to act (a trim point, a hand-over, a cut) and checks Spotify only every 5 to 20 seconds until shortly before then, instead of every second.
+
+Turn it off in Settings → Battery saver. Avoid iOS Low Power Mode during sessions where the app is needed: it forces the screen to lock after 30 seconds.
+
 If iOS closes the app in the background, the session isn't lost: reopening the app picks it up again (or offers to resume it).
 
 ### Use
