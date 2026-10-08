@@ -365,3 +365,110 @@ test("snapshot/restore continues a session where Spotify is", () => {
   simulate(r2, p, 3 * MIN);
   assert.equal(r2.active, false);
 });
+
+// --- sync between devices ----------------------------------------------------------------
+const { mergeDocs, SyncStore, createGistClient, syncOnce } = core;
+
+test("mergeDocs keeps the newest version of each item and respects deletions", () => {
+  const now = Date.now();
+  const T = (n) => now - 100000 + n; // recent timestamps
+  const a = {
+    trims: { x: { start: 1, updatedAt: T(10) }, y: { start: 2, updatedAt: T(50) } },
+    templates: [{ id: "t1", name: "A", updatedAt: T(5) }],
+    tombstones: { trims: { z: T(30) }, templates: {} },
+  };
+  const b = {
+    trims: { x: { start: 9, updatedAt: T(20) }, y: { start: 3, updatedAt: T(40) }, z: { start: 4, updatedAt: T(20) } },
+    templates: [{ id: "t1", name: "B", updatedAt: T(6) }, { id: "t2", name: "New", updatedAt: T(7) }],
+    tombstones: { trims: {}, templates: {} },
+  };
+  const m = mergeDocs(a, b, now);
+  assert.equal(m.trims.x.start, 9, "newer edit wins");
+  assert.equal(m.trims.y.start, 2, "newer edit wins the other way too");
+  assert.ok(!m.trims.z && m.tombstones.trims.z === T(30), "deleted after its last edit: stays deleted");
+  assert.deepEqual(m.templates.map((t) => t.name), ["B", "New"]);
+  // Order of arguments doesn't matter for the content.
+  const m2 = mergeDocs(b, a, now);
+  assert.deepEqual(m2.trims, m.trims);
+  // A trim re-added after it was deleted comes back.
+  const m3 = mergeDocs(m, { trims: { z: { start: 5, updatedAt: T(99) } } }, now);
+  assert.equal(m3.trims.z.start, 5);
+});
+
+function memoryStorage() {
+  const data = {};
+  return { load: (k, f) => (k in data ? JSON.parse(data[k]) : f), save: (k, v) => (data[k] = JSON.stringify(v)), data };
+}
+const KEYS = { trims: "trims", templates: "templates", tombstones: "tombs" };
+const newStore = () => new SyncStore(memoryStorage(), { keys: KEYS, defaultTemplates: () => [{ id: "default", name: "50-minute workout", updatedAt: 0, phases: [] }] });
+
+function fakeGitHub() {
+  const gists = {};
+  let n = 0;
+  const reply = (status, body) => ({ status, ok: status < 300, json: async () => body, text: async () => JSON.stringify(body) });
+  const fetchImpl = async (url, opts) => {
+    assert.equal(opts.cache, "no-store", "never read a cached gist");
+    const path = url.replace("https://api.github.com", "");
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    if (path === "/user") return reply(200, { login: "dimssen" });
+    if (path.startsWith("/gists?")) return reply(200, Object.values(gists));
+    if (path === "/gists" && opts.method === "POST") {
+      const id = `g${++n}`;
+      gists[id] = { id, files: { "playlist-plus.json": { content: body.files["playlist-plus.json"].content } } };
+      return reply(201, gists[id]);
+    }
+    const id = path.split("/")[2];
+    if (!gists[id]) return reply(404, {});
+    if (opts.method === "PATCH") gists[id].files["playlist-plus.json"].content = body.files["playlist-plus.json"].content;
+    return reply(200, gists[id]);
+  };
+  return { gists, fetchImpl };
+}
+
+test("two devices sync trims and templates through one gist", async () => {
+  const gh = fakeGitHub();
+  const phone = newStore();
+  const desktop = newStore();
+  const phoneGist = createGistClient({ token: "t", fetchImpl: gh.fetchImpl });
+  const deskGist = createGistClient({ token: "t", fetchImpl: gh.fetchImpl });
+
+  desktop.setTrim("spotify:track:a", { start: 30000, end: 120000, name: "A" });
+  await deskGist.connect(desktop.doc()); // creates the gist
+  await syncOnce(desktop, deskGist);
+  await phoneGist.connect(phone.doc()); // finds the same gist
+  assert.equal(phoneGist.gistId, deskGist.gistId);
+  assert.equal(Object.keys(gh.gists).length, 1);
+
+  await syncOnce(phone, phoneGist);
+  assert.equal(phone.trims["spotify:track:a"].start, 30000, "desktop trim reached the phone");
+
+  // Both edit offline, then sync: nothing is lost.
+  phone.setTrim("spotify:track:b", { start: 1000, name: "B" });
+  const tpl = { id: "run30", name: "30-minute run", phases: [] };
+  desktop.addTemplate(tpl);
+  desktop.removeTrim("spotify:track:a");
+  await syncOnce(phone, phoneGist);
+  await syncOnce(desktop, deskGist);
+  await syncOnce(phone, phoneGist);
+  for (const s of [phone, desktop]) {
+    assert.ok(s.trims["spotify:track:b"], "phone's new trim everywhere");
+    assert.ok(!s.trims["spotify:track:a"], "desktop's deletion everywhere");
+    assert.ok(s.templates.some((t) => t.id === "run30"), "desktop's new template everywhere");
+  }
+});
+
+test("SyncStore keeps object identity when remote changes arrive", () => {
+  const store = newStore();
+  const trimsRef = store.trims;
+  const tplRef = store.templates;
+  let remoteEvents = 0;
+  store.onChange((what, source) => source === "remote" && remoteEvents++);
+  const changed = store.apply({ trims: { x: { start: 1, updatedAt: 1 } }, templates: [{ id: "q", name: "Q", updatedAt: 1 }] });
+  assert.ok(changed);
+  assert.equal(store.trims, trimsRef);
+  assert.equal(store.templates, tplRef);
+  assert.equal(trimsRef.x.start, 1);
+  assert.equal(tplRef[0].id, "q");
+  assert.equal(remoteEvents, 1);
+  assert.equal(store.apply(store.doc()), false, "no change, no event");
+});

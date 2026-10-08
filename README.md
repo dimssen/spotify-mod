@@ -51,14 +51,14 @@ If iOS closes the app in the background, the session isn't lost: reopening the a
 
 - **Timed session:** open the **Session** tab. Tap each phase's playlist to pick one from your library, and set its time (**Minutes**, **Percent** or **Rest**). Then tap the green play button. The list icon next to it previews the plan first. During the session the screen shows a big countdown, the phase timeline, the current song and controls, and stays awake.
 - **Trim a song:** play it in Spotify, open the **Trims** tab, and tap **Trim** on the "Now playing" card. Drag the two handles, or tap **Start here** / **End here** while you listen. You can also open one of your playlists below and tap any song.
-- **Copy trims from desktop:** in the desktop extension's **Trimmed songs** tab, use **Export**. Send yourself the text and use **Import** on the phone. The phone app has the same export and import, and both versions use the same format.
+- **Sync with your computer:** see [Sync](#sync-between-phone-and-computer) below.
 
 ### Phone limitations (from iOS and Spotify, not fixable in the app)
 
 - **Trims need the app open.** iOS pauses web apps in the background. Smooth sessions don't need the app at all, apart from trimmed songs; outside sessions, trims only apply while the app is open. During a session the app keeps the screen on.
 - **Only playlists you created or collaborate on can be used.** Since February 2026, Spotify doesn't let personal apps read other people's playlists, including Spotify's own. To use one, create a playlist and add its songs to it (select all, then **Add to playlist**).
 - **No volume fades on iPhone.** iPhones don't allow remote volume control. Use Smooth transitions with Spotify's own crossfade instead (see above). Volume fades work when Spotify plays on a computer or speaker.
-- **Trims and templates are stored per device.** Use Export and Import to copy them across.
+- **Sync needs the app open:** devices sync when Playlist Plus is open (on launch, when you come back to it, after each change and every minute), not in the background.
 
 ## Desktop (Windows, macOS, Linux)
 
@@ -109,9 +109,27 @@ Notes:
 - Sessions are saved as **templates**. Use **Duplicate** to make variants, for example a 30-minute version.
 - Everything is stored locally in your Spotify client. Nothing is uploaded anywhere.
 
+## Sync between phone and computer
+
+Your trims and sessions (templates) can stay the same on every device: trim a song on your computer and it's trimmed on your phone too. They're kept in a **secret GitHub Gist** in your own GitHub account, so no server is involved.
+
+1. On any device, [create a GitHub token](https://github.com/settings/tokens/new?scopes=gist&description=Playlist%20Plus%20sync). The link pre-selects only the **gist** permission, so the token can't access anything else. Choose a long expiration, click **Generate token** and copy it.
+2. Phone: **Settings → Sync with your other devices**, paste the token, **Connect**. Desktop: **Playlist Plus → Settings → Sync**, paste the token, **Connect**.
+3. Use the same GitHub account (the same token works) on every device.
+
+How it behaves:
+
+- Each trim and session remembers when it was last changed. Syncing keeps the newest version of each one, and deletions sync too, so devices can be edited separately (even offline) without losing changes.
+- Devices sync when Playlist Plus opens, when you switch back to it, a moment after every change, and every minute while it's open. **Sync now** forces it.
+- Synced: trims and session templates. Not synced: device settings (crossfade, fades), which session is selected, and your Spotify login.
+- The gist is secret (not listed or searchable), but anyone with its link could read it. It only holds song IDs, trim times and session settings.
+- **Stop syncing** disconnects a device; it keeps its current copy. To remove everything, delete the "Playlist Plus sync" gist on GitHub.
+
+Export/Import (phone: Settings → Backup, desktop: Trimmed songs) still works for one-off copies without GitHub.
+
 ## Development
 
-- `playlist-plus.js`: the desktop extension. The top of the file is the shared core (time budgets, track planning, the session runner and the trim watcher). It's pure JavaScript with no Spotify dependencies.
+- `playlist-plus.js`: the desktop extension. The top of the file is the shared core (time budgets, track planning, the session runner, the trim watcher, and sync: merging, the local store and the Gist client). It has no Spotify dependencies.
 - `web/`: the phone app (`index.html`, `app.js`). It loads the core from `playlist-plus.js` and talks to the Spotify Web API.
 - `.github/workflows/pages.yml`: runs the tests, builds `_site/` and deploys it to GitHub Pages.
 

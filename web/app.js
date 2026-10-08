@@ -1,7 +1,7 @@
 // Playlist Plus for phones: controls the Spotify app on this phone (or any Spotify device)
 // through the Spotify Web API. Shares its playback logic with the desktop extension.
 (() => {
-  const { parseTime, formatTime, normalizePlaylistUri, computeBudgets, planSession, SessionRunner, TrimWatcher, phaseColor } = window.PlaylistPlusCore;
+  const { parseTime, formatTime, normalizePlaylistUri, computeBudgets, planSession, SessionRunner, TrimWatcher, phaseColor, SyncStore, createGistClient, createSyncer } = window.PlaylistPlusCore;
 
   // ----- storage (same keys and formats as the desktop extension) -----------
   const KEY = {
@@ -13,6 +13,10 @@
     auth: "playlist-plus:auth",
     verifier: "playlist-plus:pkce-verifier",
     session: "playlist-plus:session",
+    tombstones: "playlist-plus:tombstones",
+    syncToken: "playlist-plus:sync-token",
+    gistId: "playlist-plus:sync-gist",
+    syncLogin: "playlist-plus:sync-login",
   };
   const load = (k, fallback) => {
     try {
@@ -30,10 +34,10 @@
     }
   };
 
-  let trims = load(KEY.trims, {});
   let settings = { trimsEnabled: true, trimsInSessions: true, fadeSeconds: 3, crossfadeSeconds: 0, ...load(KEY.settings, {}) };
-  const defaultTemplate = () => ({
-    id: String(Date.now()),
+  // The built-in template has a fixed id, so it's the same template on every synced device.
+  const defaultTemplate = (id = "default-workout") => ({
+    id,
     name: "50-minute workout",
     totalMin: 50,
     shuffle: true,
@@ -45,14 +49,16 @@
       { name: "Cool-down", playlistUri: "", mode: "rest", value: 0 },
     ],
   });
-  let templates = load(KEY.templates, null) || [defaultTemplate()];
+  // Trims and templates live in a SyncStore, which tracks changes for syncing between devices.
+  const store = new SyncStore({ load, save }, {
+    keys: { trims: KEY.trims, templates: KEY.templates, tombstones: KEY.tombstones },
+    defaultTemplates: () => [{ ...defaultTemplate(), updatedAt: 0 }],
+  });
+  const trims = store.trims;
+  const templates = store.templates;
   let activeTemplateId = load(KEY.activeTemplate, templates[0].id);
-  const saveTrims = () => save(KEY.trims, trims);
   const saveSettings = () => save(KEY.settings, settings);
-  const saveTemplates = () => {
-    save(KEY.templates, templates);
-    save(KEY.activeTemplate, activeTemplateId);
-  };
+  const saveActiveTemplate = () => save(KEY.activeTemplate, activeTemplateId);
 
   // ----- Spotify auth (Authorization Code + PKCE, no server needed) ----------
   const SCOPES = "user-read-playback-state user-modify-playback-state playlist-read-private playlist-read-collaborative";
@@ -635,7 +641,8 @@
     let tpl = templates.find((t) => t.id === activeTemplateId) || templates[0];
     activeTemplateId = tpl.id;
     const root = h("div");
-    const persist = () => saveTemplates();
+    // Call after editing tpl; selecting a template only needs saveActiveTemplate().
+    const persist = () => (store.touchTemplate(tpl), saveActiveTemplate());
     const smooth = () => tpl.transitions !== "exact";
     const err = h("div", { className: "err" });
     const timeline = h("div");
@@ -683,18 +690,18 @@
             } },
             { icon: "copy", label: "Duplicate", run: () => {
               const copy = { ...JSON.parse(JSON.stringify(tpl)), id: String(Date.now()), name: `${tpl.name} (copy)` };
-              templates.push(copy);
+              store.addTemplate(copy);
               activeTemplateId = copy.id;
               tpl = copy;
-              persist();
+              saveActiveTemplate();
               draw();
             } },
             templates.length > 1 && { icon: "trash", label: "Delete", danger: true, run: async () => {
               if (!(await confirmSheet(`Delete “${tpl.name}”?`, "This can't be undone.", "Delete"))) return;
-              templates = templates.filter((t) => t !== tpl);
+              store.removeTemplate(tpl);
               tpl = templates[0];
               activeTemplateId = tpl.id;
-              persist();
+              saveActiveTemplate();
               draw();
             } },
           ]) }, icon("more")),
@@ -714,15 +721,15 @@
           templates.map((t) => h("button", { className: "chip" + (t === tpl ? " on" : ""), onClick: () => {
             activeTemplateId = t.id;
             tpl = t;
-            persist();
+            saveActiveTemplate();
             draw();
           } }, t.name)),
           h("button", { className: "chip", "aria-label": "New session", onClick: () => {
-            const t = { ...defaultTemplate(), name: "New session" };
-            templates.push(t);
+            const t = { ...defaultTemplate(String(Date.now())), name: "New session" };
+            store.addTemplate(t);
             activeTemplateId = t.id;
             tpl = t;
-            persist();
+            saveActiveTemplate();
             draw();
           } }, icon("plus"), "New"),
         ),
@@ -1157,17 +1164,15 @@
       h("div", { className: "spacer" }),
       h("button", { className: "btn block", onClick: () => {
         const full = start === 0 && end >= dur;
-        if (full) delete trims[t.uri];
-        else trims[t.uri] = { start, end: end >= dur ? null : end, name: t.name, artist: t.artist, art: t.art || null };
-        saveTrims();
+        if (full) store.removeTrim(t.uri);
+        else store.setTrim(t.uri, { start, end: end >= dur ? null : end, name: t.name, artist: t.artist, art: t.art || null });
         toast(full ? `“${t.name}” plays in full` : `Trimmed “${t.name}”`);
         close();
         if (tab === "trims") renderTab();
       } }, icon("check"), "Save trim"),
       trims[t.uri] && h("div", { style: "text-align:center;margin-top:8px" },
         h("button", { className: "btn danger small", onClick: () => {
-          delete trims[t.uri];
-          saveTrims();
+          store.removeTrim(t.uri);
           toast(`Removed trim from “${t.name}”`);
           close();
           if (tab === "trims") renderTab();
@@ -1247,11 +1252,26 @@
   function settingsTab() {
     setHero("#535353");
     const devBox = h("div", { className: "list" });
+    const syncBox = h("div");
+    const drawSync = () => {
+      if (!syncClient) {
+        live.syncRow = null;
+        return fill(syncBox, setting("Sync with your other devices", "Keep trims and sessions the same on your phone and computer.", icon("chevronRight"), () => openSyncSetup(drawSync)));
+      }
+      live.syncRow = h("div");
+      drawSyncRow(live.syncRow);
+      fill(syncBox, live.syncRow, setting("Stop syncing", "This device keeps its current trims and sessions.", icon("logout"), async () => {
+        if (!(await confirmSheet("Stop syncing?", "This device keeps its current copy. Your other devices keep syncing.", "Stop syncing"))) return;
+        disconnectSync();
+        drawSync();
+      }));
+    };
     const setting = (title, desc, control, onClick) =>
       h(onClick ? "button" : "div", { className: "setting", onClick },
         h("div", { className: "grow" }, h("div", { className: "t" }, title), desc && h("div", { className: "s" }, desc)),
         control,
       );
+    drawSync();
     const switchSetting = (key, title, desc) =>
       setting(title, desc, toggle(settings[key], (v) => ((settings[key] = v), saveSettings())));
 
@@ -1337,9 +1357,7 @@
           try {
             const data = JSON.parse(area.value);
             if (typeof data !== "object" || !data || Array.isArray(data)) throw new Error();
-            const n = Object.keys(data).length;
-            Object.assign(trims, data);
-            saveTrims();
+            const n = store.importTrims(data);
             toast(`Imported ${n} trim${n === 1 ? "" : "s"}`);
             close();
           } catch {
@@ -1371,6 +1389,8 @@
           h("button", { "aria-label": "Longer", onClick: fadeStep(1) }, icon("plus")),
         ),
       ),
+      h("h2", null, "Sync"),
+      syncBox,
       h("h2", null, "Devices"),
       devBox,
       h("h2", null, "Backup"),
@@ -1389,6 +1409,98 @@
         h("p", { className: "sub" }, "Playlist Plus remote-controls Spotify through Spotify's official Web API. iOS pauses web apps in the background, so trims and exact phase timing need this app open. The screen stays awake during sessions. If the phone locks, Spotify keeps playing the planned songs in order, and the app catches up when you return."),
       ),
     );
+  }
+
+  // ----- sync between devices (private GitHub Gist) --------------------------------------
+  const makeSyncClient = () => {
+    const token = load(KEY.syncToken, "");
+    return token ? createGistClient({ token, gistId: load(KEY.gistId, null) }) : null;
+  };
+  let syncClient = makeSyncClient();
+  let syncStatus = { state: syncClient ? "idle" : "off", error: null };
+  let pendingRefresh = false;
+  const syncer = createSyncer(store, () => (syncClient && syncClient.gistId ? syncClient : null), {
+    onStatus: (state, info) => {
+      syncStatus = { state, error: state === "error" ? info : null };
+      if (state === "synced" && info) refreshAfterRemoteChange();
+      if (live.syncRow && live.syncRow.isConnected) drawSyncRow(live.syncRow);
+    },
+  });
+
+  // Show changes made on another device, without yanking anything out from under the user.
+  function refreshAfterRemoteChange() {
+    const busy = document.querySelector(".sheet-wrap") || ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement && document.activeElement.tagName);
+    if (busy) return (pendingRefresh = true);
+    pendingRefresh = false;
+    if (!auth || !app.contains(main)) return;
+    if (tab === "session" && runner && runner.active) return; // the running view doesn't show templates
+    renderTab();
+  }
+  document.addEventListener("focusout", () => pendingRefresh && setTimeout(refreshAfterRemoteChange, 300));
+
+  async function connectSync(token) {
+    const client = createGistClient({ token });
+    const login = await client.user();
+    await client.connect(store.doc());
+    save(KEY.syncToken, token);
+    save(KEY.gistId, client.gistId);
+    save(KEY.syncLogin, login);
+    syncClient = client;
+    await syncer.now();
+    if (syncStatus.state === "error") throw new Error(syncStatus.error);
+    return login;
+  }
+  function disconnectSync() {
+    [KEY.syncToken, KEY.gistId, KEY.syncLogin].forEach((k) => localStorage.removeItem(k));
+    syncClient = null;
+    syncStatus = { state: "off", error: null };
+  }
+  const ago = (t) => {
+    const s = Math.round((Date.now() - t) / 1000);
+    return s < 10 ? "just now" : s < 60 ? `${s} s ago` : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`;
+  };
+  function drawSyncRow(el) {
+    const login = load(KEY.syncLogin, "");
+    const desc =
+      syncStatus.state === "syncing" ? "Syncing…" : syncStatus.state === "error" ? syncStatus.error : syncer.lastSync ? `Up to date · ${ago(syncer.lastSync)}` : "Waiting to sync";
+    fill(el,
+      h("div", { className: "setting" },
+        h("div", { className: syncStatus.state === "error" ? "" : "green", style: "width:24px" }, icon(syncStatus.state === "error" ? "info" : "check")),
+        h("div", { className: "grow" }, h("div", { className: "t" }, `Synced with GitHub${login ? ` · @${login}` : ""}`), h("div", { className: "s" + (syncStatus.state === "error" ? " err" : "") }, desc)),
+        h("button", { className: "btn outline small", disabled: syncStatus.state === "syncing", onClick: () => syncer.now() }, "Sync now"),
+      ),
+    );
+  }
+  function openSyncSetup(onDone) {
+    const input = h("input", { className: "field", placeholder: "Paste your GitHub token", autocapitalize: "off", autocomplete: "off", spellcheck: "false" });
+    const step = (n, ...content) => h("div", { className: "step" }, h("span", { className: "n" }, n), h("div", null, ...content));
+    const close = openSheet(h("div", null,
+      h("h3", null, "Sync your devices"),
+      h("p", { className: "sub" }, "Your trims and sessions are kept in a private GitHub Gist, so your phone and computer always have the same ones. You'll need a free GitHub account; use the same one on every device."),
+      h("div", { className: "steps", style: "margin:16px 0" },
+        step(1, h("a", { href: "https://github.com/settings/tokens/new?scopes=gist&description=Playlist%20Plus%20sync", target: "_blank", rel: "noopener" }, "Create a GitHub token"), ". Only “gist” is ticked, so the token can't touch anything else. Pick a long expiration, tap ", h("b", null, "Generate token"), " and copy it."),
+        step(2, "Paste it here, on each device:"),
+      ),
+      input,
+      h("div", { className: "spacer" }),
+      h("button", { className: "btn block", onClick: async (e) => {
+        const token = input.value.trim();
+        if (token.length < 20) return toast("That doesn't look like a GitHub token.", true);
+        e.target.disabled = true;
+        e.target.textContent = "Connecting…";
+        try {
+          const login = await connectSync(token);
+          toast(`Synced with @${login}`);
+          close();
+          onDone && onDone();
+        } catch (err) {
+          toast(err.message, true);
+          e.target.disabled = false;
+          e.target.textContent = "Connect";
+        }
+      } }, "Connect"),
+    ));
+    setTimeout(() => input.focus(), 320);
   }
 
   // ----- session lifecycle --------------------------------------------------------------
@@ -1598,6 +1710,7 @@
     player.fetchedAt = 0; // state is stale after being in the background
     player.poll();
     keepAwake();
+    syncer.now();
   });
 
   // ----- boot --------------------------------------------------------------------------------
@@ -1608,6 +1721,7 @@
       fatal = e.message;
     }
     render();
+    syncer.start();
     if (auth) {
       setInterval(tick, 100);
       pollLoop();

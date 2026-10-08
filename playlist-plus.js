@@ -633,6 +633,303 @@ const PlaylistPlusCore = (() => {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Sync: trims and session templates are kept the same on every device.
+  // Each trim/template carries `updatedAt`; deletions leave a dated tombstone. Merging
+  // keeps the newest version of every item, so it doesn't matter which device syncs first.
+  // ---------------------------------------------------------------------------
+  const TOMBSTONE_TTL = 180 * 24 * 3600 * 1000;
+
+  function stableStringify(v) {
+    if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
+    if (v && typeof v === "object") {
+      return `{${Object.keys(v)
+        .filter((k) => v[k] !== undefined)
+        .sort()
+        .map((k) => `${JSON.stringify(k)}:${stableStringify(v[k])}`)
+        .join(",")}}`;
+    }
+    return JSON.stringify(v === undefined ? null : v);
+  }
+
+  const emptyDoc = () => ({ version: 1, trims: {}, templates: [], tombstones: { trims: {}, templates: {} } });
+
+  function normalizeDoc(doc) {
+    const d = emptyDoc();
+    if (!doc || typeof doc !== "object") return d;
+    if (doc.trims && typeof doc.trims === "object") d.trims = doc.trims;
+    if (Array.isArray(doc.templates)) d.templates = doc.templates.filter((t) => t && t.id);
+    if (doc.tombstones) {
+      d.tombstones.trims = doc.tombstones.trims || {};
+      d.tombstones.templates = doc.tombstones.templates || {};
+    }
+    return d;
+  }
+
+  /** Merge two sync documents: newest version of each trim/template wins; deletions win if newer. */
+  function mergeDocs(a, b, now = Date.now()) {
+    a = normalizeDoc(a);
+    b = normalizeDoc(b);
+    const out = emptyDoc();
+    const pick = (keys, getA, getB, tombA, tombB, put, tomb) => {
+      for (const k of keys) {
+        const ea = getA(k);
+        const eb = getB(k);
+        const live = !ea ? eb : !eb ? ea : (eb.updatedAt || 0) > (ea.updatedAt || 0) ? eb : ea;
+        const deletedAt = Math.max(tombA[k] || 0, tombB[k] || 0);
+        if (live && (live.updatedAt || 0) >= deletedAt) put(k, live);
+        else if (deletedAt && now - deletedAt < TOMBSTONE_TTL) tomb[k] = deletedAt;
+      }
+    };
+    const trimKeys = new Set([...Object.keys(a.trims), ...Object.keys(b.trims), ...Object.keys(a.tombstones.trims), ...Object.keys(b.tombstones.trims)]);
+    pick(trimKeys, (k) => a.trims[k], (k) => b.trims[k], a.tombstones.trims, b.tombstones.trims, (k, v) => (out.trims[k] = v), out.tombstones.trims);
+
+    const byId = (list) => Object.fromEntries(list.map((t) => [t.id, t]));
+    const ta = byId(a.templates);
+    const tb = byId(b.templates);
+    // Keep a stable order: a's templates first, then new ones from b.
+    const order = [...a.templates.map((t) => t.id), ...b.templates.map((t) => t.id).filter((id) => !ta[id])];
+    const tplKeys = new Set([...order, ...Object.keys(a.tombstones.templates), ...Object.keys(b.tombstones.templates)]);
+    const kept = {};
+    pick(tplKeys, (k) => ta[k], (k) => tb[k], a.tombstones.templates, b.tombstones.templates, (k, v) => (kept[k] = v), out.tombstones.templates);
+    out.templates = order.filter((id) => kept[id]).map((id) => kept[id]);
+    return out;
+  }
+
+  /**
+   * Local trims + templates with change tracking. `trims` and `templates` keep their object
+   * identity forever (they're updated in place), so code holding references stays valid.
+   * storage: { load(key, fallback), save(key, value) }.
+   */
+  class SyncStore {
+    constructor(storage, { keys, defaultTemplates }) {
+      this.storage = storage;
+      this.keys = keys;
+      this.trims = storage.load(keys.trims, {}) || {};
+      const tpls = storage.load(keys.templates, null);
+      this.templates = Array.isArray(tpls) && tpls.length ? tpls : defaultTemplates();
+      this.tombstones = { trims: {}, templates: {}, ...(storage.load(keys.tombstones, {}) || {}) };
+      this.defaultTemplates = defaultTemplates;
+      this.listeners = [];
+    }
+
+    onChange(fn) {
+      this.listeners.push(fn);
+    }
+
+    _changed(what, source = "local") {
+      if (what !== "templates") this.storage.save(this.keys.trims, this.trims);
+      if (what !== "trims") this.storage.save(this.keys.templates, this.templates);
+      this.storage.save(this.keys.tombstones, this.tombstones);
+      this.listeners.forEach((fn) => fn(what, source));
+    }
+
+    setTrim(uri, data) {
+      this.trims[uri] = { ...data, updatedAt: Date.now() };
+      delete this.tombstones.trims[uri];
+      this._changed("trims");
+    }
+
+    removeTrim(uri) {
+      if (!this.trims[uri]) return;
+      delete this.trims[uri];
+      this.tombstones.trims[uri] = Date.now();
+      this._changed("trims");
+    }
+
+    importTrims(data) {
+      const now = Date.now();
+      let n = 0;
+      for (const [uri, t] of Object.entries(data || {})) {
+        if (!t || typeof t !== "object") continue;
+        this.trims[uri] = { ...t, updatedAt: now };
+        delete this.tombstones.trims[uri];
+        n++;
+      }
+      this._changed("trims");
+      return n;
+    }
+
+    /** Call after editing a template in place. */
+    touchTemplate(tpl) {
+      tpl.updatedAt = Date.now();
+      this._changed("templates");
+    }
+
+    addTemplate(tpl) {
+      tpl.updatedAt = Date.now();
+      this.templates.push(tpl);
+      this._changed("templates");
+    }
+
+    removeTemplate(tpl) {
+      const i = this.templates.indexOf(tpl);
+      if (i < 0) return;
+      this.templates.splice(i, 1);
+      this.tombstones.templates[tpl.id] = Date.now();
+      if (!this.templates.length) this.templates.push(...this.defaultTemplates());
+      this._changed("templates");
+    }
+
+    doc() {
+      return { version: 1, trims: this.trims, templates: this.templates, tombstones: this.tombstones };
+    }
+
+    /** Replace local data with a merged document; returns true if anything changed. */
+    apply(doc) {
+      const before = stableStringify(this.doc());
+      const d = normalizeDoc(doc);
+      for (const k of Object.keys(this.trims)) if (!(k in d.trims)) delete this.trims[k];
+      Object.assign(this.trims, d.trims);
+      this.templates.splice(0, this.templates.length, ...(d.templates.length ? d.templates : this.defaultTemplates()));
+      this.tombstones = d.tombstones;
+      const changed = stableStringify(this.doc()) !== before;
+      if (changed) this._changed("all", "remote");
+      return changed;
+    }
+  }
+
+  /**
+   * Stores the sync document in a secret GitHub Gist, using a token with only the "gist" scope.
+   */
+  function createGistClient({ token, gistId = null, fetchImpl }) {
+    const FILE = "playlist-plus.json";
+    const doFetch = fetchImpl || ((...a) => fetch(...a));
+    let id = gistId;
+    async function gh(method, path, body) {
+      const res = await doFetch(`https://api.github.com${path}`, {
+        method,
+        cache: "no-store",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          ...(body ? { "Content-Type": "application/json" } : {}),
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (res.status === 401) throw new Error("GitHub didn't accept the token. Create a new one and reconnect.");
+      if (res.status === 404 && path.startsWith("/gists/")) return null;
+      if (!res.ok) throw new Error(`GitHub error ${res.status}`);
+      return res.status === 204 ? null : res.json();
+    }
+    async function contentOf(gist) {
+      const f = gist && gist.files && gist.files[FILE];
+      if (!f) return null;
+      let text = f.content;
+      if (f.truncated && f.raw_url) text = await (await doFetch(f.raw_url, { cache: "no-store" })).text();
+      try {
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
+    }
+    return {
+      get gistId() {
+        return id;
+      },
+      async user() {
+        const u = await gh("GET", "/user");
+        return u && u.login;
+      },
+      /** Find the sync gist (or create it). Returns the remote document, or null if new. */
+      async connect(initialDoc) {
+        if (id) {
+          const g = await gh("GET", `/gists/${id}`);
+          if (g) return contentOf(g);
+          id = null;
+        }
+        for (let page = 1; page <= 10; page++) {
+          const list = await gh("GET", `/gists?per_page=100&page=${page}`);
+          const found = (list || []).find((g) => g.files && g.files[FILE]);
+          if (found) {
+            id = found.id;
+            return contentOf(await gh("GET", `/gists/${id}`));
+          }
+          if (!list || list.length < 100) break;
+        }
+        const created = await gh("POST", "/gists", {
+          description: "Playlist Plus sync (trims and timed sessions)",
+          public: false,
+          files: { [FILE]: { content: JSON.stringify(initialDoc) } },
+        });
+        id = created.id;
+        return null;
+      },
+      async read() {
+        if (!id) throw new Error("Not connected");
+        const g = await gh("GET", `/gists/${id}`);
+        if (!g) throw new Error("The sync gist was deleted. Reconnect to create a new one.");
+        return contentOf(g);
+      },
+      async write(doc) {
+        if (!id) throw new Error("Not connected");
+        await gh("PATCH", `/gists/${id}`, { files: { [FILE]: { content: JSON.stringify(doc) } } });
+      },
+    };
+  }
+
+  /** One sync round: pull, merge, apply locally, push if the remote differs. */
+  async function syncOnce(store, client) {
+    const remote = await client.read();
+    const merged = mergeDocs(store.doc(), remote);
+    const changedLocally = store.apply(merged);
+    if (!remote || stableStringify(normalizeDoc(remote)) !== stableStringify(merged)) await client.write(merged);
+    return changedLocally;
+  }
+
+  /**
+   * Keeps a store in sync while the app is open: on start, after local changes (debounced),
+   * when the app comes back to the foreground and every `intervalMs`.
+   */
+  function createSyncer(store, getClient, { intervalMs = 60000, debounceMs = 1500, onStatus = () => {} } = {}) {
+    let timer = null;
+    let running = null;
+    let again = false;
+    const syncer = {
+      lastSync: 0,
+      lastError: null,
+      async now() {
+        const client = getClient();
+        if (!client) return false;
+        if (running) {
+          again = true;
+          return running;
+        }
+        onStatus("syncing");
+        running = (async () => {
+          try {
+            const changed = await syncOnce(store, client);
+            syncer.lastSync = Date.now();
+            syncer.lastError = null;
+            onStatus("synced", changed);
+            return changed;
+          } catch (e) {
+            syncer.lastError = e.message;
+            onStatus("error", e.message);
+            return false;
+          } finally {
+            running = null;
+            if (again) {
+              again = false;
+              syncer.soon();
+            }
+          }
+        })();
+        return running;
+      },
+      soon() {
+        clearTimeout(timer);
+        timer = setTimeout(() => syncer.now(), debounceMs);
+      },
+      start() {
+        store.onChange((what, source) => source === "local" && syncer.soon());
+        setInterval(() => syncer.now(), intervalMs);
+        return syncer.now();
+      },
+    };
+    return syncer;
+  }
+
   // 24px icon paths shared by the desktop and phone UIs (objects are filled, strings stroked).
   const ICONS = {
     timer: '<circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9 2h6"/>',
@@ -674,7 +971,7 @@ const PlaylistPlusCore = (() => {
   const PHASE_COLORS = ["#e13300", "#8d67ab", "#509bf5", "#e8115b", "#27856a", "#ba5d07", "#477d95", "#148a08"];
   const phaseColor = (i) => PHASE_COLORS[i % PHASE_COLORS.length];
 
-  return { parseTime, formatTime, normalizePlaylistUri, computeBudgets, trackBounds, shuffled, planPhase, SessionRunner, TrimWatcher, phaseColor, ICONS, planPhaseSmooth, planSession };
+  return { parseTime, formatTime, normalizePlaylistUri, computeBudgets, trackBounds, shuffled, planPhase, SessionRunner, TrimWatcher, phaseColor, ICONS, planPhaseSmooth, planSession, mergeDocs, stableStringify, SyncStore, createGistClient, syncOnce, createSyncer };
 })();
 
 if (typeof module !== "undefined" && module.exports) module.exports = PlaylistPlusCore;
@@ -697,7 +994,7 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
     Spicetify.Topbar;
   while (!ready()) await new Promise((r) => setTimeout(r, 300));
 
-  const { parseTime, formatTime, normalizePlaylistUri, computeBudgets, planSession, SessionRunner, TrimWatcher, phaseColor, ICONS } = PlaylistPlusCore;
+  const { parseTime, formatTime, normalizePlaylistUri, computeBudgets, planSession, SessionRunner, TrimWatcher, phaseColor, ICONS, SyncStore, createGistClient, createSyncer } = PlaylistPlusCore;
 
   // ----- storage -----------------------------------------------------------
   const KEY = {
@@ -705,6 +1002,10 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
     templates: "playlist-plus:templates",
     settings: "playlist-plus:settings",
     activeTemplate: "playlist-plus:active-template",
+    tombstones: "playlist-plus:tombstones",
+    syncToken: "playlist-plus:sync-token",
+    gistId: "playlist-plus:sync-gist",
+    syncLogin: "playlist-plus:sync-login",
   };
   const load = (k, fallback) => {
     try {
@@ -716,10 +1017,10 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
   };
   const save = (k, v) => Spicetify.LocalStorage.set(k, JSON.stringify(v));
 
-  let trims = load(KEY.trims, {}); // uri -> { start, end, name, artist }
   let settings = { trimsEnabled: true, trimsInSessions: true, fadeSeconds: 3, ...load(KEY.settings, {}) };
-  const defaultTemplate = () => ({
-    id: String(Date.now()),
+  // The built-in template has a fixed id, so it's the same template on every synced device.
+  const defaultTemplate = (id = "default-workout") => ({
+    id,
     name: "50-minute workout",
     totalMin: 50,
     shuffle: true,
@@ -730,14 +1031,16 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
       { name: "Cool-down", playlistUri: "", mode: "rest", value: 0 },
     ],
   });
-  let templates = load(KEY.templates, null) || [defaultTemplate()];
+  // Trims and templates live in a SyncStore, which tracks changes for syncing between devices.
+  const store = new SyncStore({ load, save }, {
+    keys: { trims: KEY.trims, templates: KEY.templates, tombstones: KEY.tombstones },
+    defaultTemplates: () => [{ ...defaultTemplate(), updatedAt: 0 }],
+  });
+  const trims = store.trims; // uri -> { start, end, name, artist, art, updatedAt }
+  const templates = store.templates;
   let activeTemplateId = load(KEY.activeTemplate, templates[0].id);
-  const saveTrims = () => save(KEY.trims, trims);
   const saveSettings = () => save(KEY.settings, settings);
-  const saveTemplates = () => {
-    save(KEY.templates, templates);
-    save(KEY.activeTemplate, activeTemplateId);
-  };
+  const saveActiveTemplate = () => save(KEY.activeTemplate, activeTemplateId);
 
   // ----- player adapter ----------------------------------------------------
   const P = Spicetify.Player;
@@ -1038,15 +1341,13 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
       h("div", { className: "pp-row", style: "margin-top:20px" },
         h("button", { className: "pp-btn", onClick: () => {
           const full = start === 0 && end >= dur;
-          if (full) delete trims[uri];
-          else trims[uri] = { start, end: end >= dur ? null : end, name: info.name, artist: info.artist, art: info.art || null };
-          saveTrims();
+          if (full) store.removeTrim(uri);
+          else store.setTrim(uri, { start, end: end >= dur ? null : end, name: info.name, artist: info.artist, art: info.art || null });
           Spicetify.PopupModal.hide();
           notify(full ? `"${info.name}" plays in full` : `Trimmed "${info.name}"`);
         } }, icon("check"), "Save trim"),
         trims[uri] && h("button", { className: "pp-btn danger", onClick: () => {
-          delete trims[uri];
-          saveTrims();
+          store.removeTrim(uri);
           Spicetify.PopupModal.hide();
           notify(`Removed trim from "${info.name}"`);
         } }, "Remove trim"),
@@ -1064,6 +1365,7 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
   // ----- main panel --------------------------------------------------------
   let runner = null;
   let panelTab = "session";
+  let panelRoot = null;
 
   async function openPanel(tab) {
     if (tab) panelTab = tab;
@@ -1080,7 +1382,8 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
       fill(body, panelTab === "session" ? sessionTab(playlists) : panelTab === "trims" ? trimsTab(render) : settingsTab());
     };
     render();
-    Spicetify.PopupModal.display({ title: "Playlist Plus", content: h("div", { className: "pp" }, tabs, body), isLarge: true });
+    panelRoot = h("div", { className: "pp" }, tabs, body);
+    Spicetify.PopupModal.display({ title: "Playlist Plus", content: panelRoot, isLarge: true });
   }
 
   function sessionTab(playlists) {
@@ -1089,7 +1392,8 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
     const err = h("div", { className: "pp-error" });
     const planBox = h("div", { className: "pp-plan" });
     const timeline = h("div");
-    const persist = () => saveTemplates();
+    // Call after editing tpl; selecting a template only needs saveActiveTemplate().
+    const persist = () => (store.touchTemplate(tpl), saveActiveTemplate());
     // The desktop app can fade, so exact timing is its default.
     const smooth = () => tpl.transitions === "smooth";
 
@@ -1175,15 +1479,15 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
           templates.map((t) => h("button", { className: "pp-tab" + (t === tpl ? " on" : ""), onClick: () => {
             activeTemplateId = t.id;
             tpl = t;
-            persist();
+            saveActiveTemplate();
             render();
           } }, t.name)),
           h("button", { className: "pp-icon-btn", title: "New session", onClick: () => {
-            const t = { ...defaultTemplate(), name: "New session" };
-            templates.push(t);
+            const t = { ...defaultTemplate(String(Date.now())), name: "New session" };
+            store.addTemplate(t);
             activeTemplateId = t.id;
             tpl = t;
-            persist();
+            saveActiveTemplate();
             render();
           } }, icon("plus")),
           h("div", { className: "pp-grow" }),
@@ -1196,18 +1500,18 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
           } }, icon("edit")),
           h("button", { className: "pp-icon-btn", title: "Duplicate", onClick: () => {
             const copy = { ...JSON.parse(JSON.stringify(tpl)), id: String(Date.now()), name: `${tpl.name} (copy)` };
-            templates.push(copy);
+            store.addTemplate(copy);
             activeTemplateId = copy.id;
             tpl = copy;
-            persist();
+            saveActiveTemplate();
             render();
           } }, icon("copy")),
           h("button", { className: "pp-icon-btn", title: "Delete", disabled: templates.length < 2, onClick: () => {
             if (!confirm(`Delete "${tpl.name}"?`)) return;
-            templates = templates.filter((t) => t !== tpl);
+            store.removeTemplate(tpl);
             tpl = templates[0];
             activeTemplateId = tpl.id;
-            persist();
+            saveActiveTemplate();
             render();
           } }, icon("trash")),
         ),
@@ -1335,7 +1639,7 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
                 ),
                 h("span", { className: "e pp-green", style: "display:flex;align-items:center;gap:4px" }, icon("scissors", 12), `${formatTime(t.start || 0)} – ${t.end ? formatTime(t.end) : "end"}`),
                 h("button", { className: "pp-icon-btn", title: "Edit", onClick: () => openTrimEditor(uri) }, icon("edit")),
-                h("button", { className: "pp-icon-btn", title: "Remove", onClick: () => (delete trims[uri], saveTrims(), rerender()) }, icon("trash")),
+                h("button", { className: "pp-icon-btn", title: "Remove", onClick: () => (store.removeTrim(uri), rerender()) }, icon("trash")),
               ),
             ),
           )
@@ -1358,8 +1662,7 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
           try {
             const data = JSON.parse(io.value);
             if (typeof data !== "object" || !data || Array.isArray(data)) throw new Error();
-            Object.assign(trims, data);
-            saveTrims();
+            store.importTrims(data);
             notify("Trims imported");
             rerender();
           } catch {
@@ -1376,14 +1679,88 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
         h("div", { className: "pp-grow" }, h("div", { className: "t" }, title), desc && h("div", { className: "pp-muted" }, desc)),
         control,
       );
+    const syncBox = h("div");
+    const drawSync = () => {
+      if (!syncClient) {
+        const input = h("input", { type: "password", placeholder: "GitHub token", style: "width:220px", "aria-label": "GitHub token" });
+        return fill(syncBox,
+          row("Sync with your phone", h("span", null,
+            "Keeps trims and sessions the same on every device, using a private GitHub Gist. ",
+            h("a", { href: "https://github.com/settings/tokens/new?scopes=gist&description=Playlist%20Plus%20sync", style: "color:var(--pp-green)" }, "Create a token"),
+            " with only “gist” ticked, then paste it here. Use the same GitHub account everywhere.",
+          ), h("div", { className: "pp-row", style: "margin:0;flex-wrap:nowrap" },
+            input,
+            h("button", { className: "pp-btn small", onClick: async (e) => {
+              e.target.disabled = true;
+              try {
+                const login = await connectSync(input.value.trim());
+                notify(`Synced with @${login}`);
+              } catch (err) {
+                notify(err.message, true);
+              }
+              drawSync();
+            } }, "Connect"),
+          )),
+        );
+      }
+      const st = syncStatus;
+      fill(syncBox,
+        row(`Synced with GitHub · @${load(KEY.syncLogin, "")}`,
+          st.state === "error" ? h("span", { style: "color:#f3727f" }, st.error) : st.state === "syncing" ? "Syncing…" : syncer.lastSync ? `Up to date · ${new Date(syncer.lastSync).toLocaleTimeString()}` : "Waiting to sync",
+          h("div", { className: "pp-row", style: "margin:0" },
+            h("button", { className: "pp-btn sec small", onClick: async () => (await syncer.now(), drawSync()) }, "Sync now"),
+            h("button", { className: "pp-btn danger small", onClick: () => (disconnectSync(), drawSync()) }, "Stop syncing"),
+          ),
+        ),
+      );
+    };
+    drawSync();
     return h("div", null,
       row("Trim songs while listening", "Apply your trims whenever a trimmed song plays.", toggle(settings.trimsEnabled, (v) => ((settings.trimsEnabled = v), saveSettings()))),
       row("Trim songs in timed sessions", null, toggle(settings.trimsInSessions, (v) => ((settings.trimsInSessions = v), saveSettings()))),
       row("Fade out cut songs", "Seconds to fade when a phase ends mid-song.",
         h("input", { type: "number", min: "0", max: "15", value: settings.fadeSeconds, "aria-label": "Fade seconds", onChange: (e) => ((settings.fadeSeconds = Math.max(0, Math.min(15, Number(e.target.value) || 0))), saveSettings()) }),
       ),
+      h("h3", null, "Sync"),
+      syncBox,
     );
   }
+
+  // ----- sync between devices (private GitHub Gist) ------------------------
+  const makeSyncClient = () => {
+    const token = load(KEY.syncToken, "");
+    return token ? createGistClient({ token, gistId: load(KEY.gistId, null) }) : null;
+  };
+  let syncClient = makeSyncClient();
+  let syncStatus = { state: syncClient ? "idle" : "off", error: null };
+  const syncer = createSyncer(store, () => (syncClient && syncClient.gistId ? syncClient : null), {
+    onStatus: (state, info) => {
+      syncStatus = { state, error: state === "error" ? info : null };
+      // Show changes from another device in the open panel, unless the user is typing in it.
+      const typing = panelRoot && panelRoot.contains(document.activeElement) && /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName);
+      if (state === "synced" && info && panelRoot && panelRoot.isConnected && !typing && panelTab !== "settings") openPanel(panelTab);
+    },
+  });
+  async function connectSync(token) {
+    if (token.length < 20) throw new Error("That doesn't look like a GitHub token.");
+    const client = createGistClient({ token });
+    const login = await client.user();
+    await client.connect(store.doc());
+    save(KEY.syncToken, token);
+    save(KEY.gistId, client.gistId);
+    save(KEY.syncLogin, login);
+    syncClient = client;
+    await syncer.now();
+    if (syncStatus.state === "error") throw new Error(syncStatus.error);
+    return login;
+  }
+  function disconnectSync() {
+    [KEY.syncToken, KEY.gistId, KEY.syncLogin].forEach((k) => Spicetify.LocalStorage.remove(k));
+    syncClient = null;
+    syncStatus = { state: "off", error: null };
+  }
+  syncer.start();
+  window.addEventListener("focus", () => syncer.now());
 
   // ----- session lifecycle -------------------------------------------------
   const widget = h("div", { id: "pp-widget", className: "pp", style: "display:none" });
