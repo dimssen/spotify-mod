@@ -140,13 +140,17 @@ Export/Import (phone: Settings → Backup, desktop: Trimmed songs) still works f
 ## Development
 
 - `playlist-plus.js`: the desktop extension. The top of the file is the shared core (time budgets, track planning, the session runner, the trim watcher, and sync: merging, the local store and the Gist client). It has no Spotify dependencies.
-- `web/`: the phone app (`index.html`, `app.js`). It loads the core from `playlist-plus.js` and talks to the Spotify Web API.
-- `.github/workflows/pages.yml`: runs the tests, builds `_site/` and deploys it to GitHub Pages.
+- `web/`: the phone app (`index.html`, `app.js`). It talks to the Spotify Web API.
+- `scripts/build-web.js`: builds the phone app into `_site/`. It takes only the shared core from `playlist-plus.js` (not the desktop UI), minifies the JS and CSS with esbuild, and gives scripts content-hashed names so new versions load at once despite caching.
+- `.github/workflows/pages.yml`: installs, runs the tests, builds `_site/` and deploys it to GitHub Pages.
 
 ```sh
-npm test            # core logic, tested against simulated desktop and phone players
+npm ci              # once: installs the build tool (esbuild)
+npm test            # core logic (simulated desktop and phone players) and the build
 npm run serve:web   # build and serve the phone app at http://127.0.0.1:8080
 ```
+
+Performance notes for the phone app: album art is lazy-loaded; playlists and their songs are cached on the phone (song lists are reused only while the playlist's snapshot id is unchanged) and requested with only the fields the app uses; long lists show 50 rows at a time; scripts are deferred and the web font doesn't block the first paint.
 
 To log in to a local copy, add `http://127.0.0.1:8080/` as a Redirect URI in your Spotify app. Spotify accepts plain http only on 127.0.0.1.
 

@@ -6,5 +6,8 @@
     "test": "node --test \"test/*.test.js\"",
     "build:web": "node scripts/build-web.js",
     "serve:web": "node scripts/build-web.js && python3 -m http.server 8080 -d _site"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
   }
 }

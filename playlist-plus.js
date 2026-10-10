@@ -96,7 +96,28 @@ const PlaylistPlusCore = (() => {
    * Songs are told apart by title + artist, so the same song on a single and on an album
    * (two different Spotify URIs) still counts as a repeat.
    */
-  const songKey = (t) => (t.name && t.name !== t.uri ? `${t.name}|${t.artist || ""}`.toLowerCase().trim() : t.uri);
+  const keyCache = new WeakMap();
+  const songKey = (t) => {
+    let k = keyCache.get(t);
+    if (k === undefined) {
+      k = t.name && t.name !== t.uri ? `${t.name}|${t.artist || ""}`.toLowerCase().trim() : t.uri;
+      keyCache.set(t, k);
+    }
+    return k;
+  };
+
+  /** Trimmed song lengths, worked out once per plan (the planners look them up a lot). */
+  const lengthOf = (trims) => {
+    const cache = new Map();
+    return (t) => {
+      let v = cache.get(t);
+      if (v === undefined) {
+        v = trackBounds(t, trims).length;
+        cache.set(t, v);
+      }
+      return v;
+    };
+  };
 
   /** Session-wide memory of what's been planned, so nothing repeats across phases. */
   const newMemory = () => ({ used: new Set(), history: [] });
@@ -186,10 +207,10 @@ const PlaylistPlusCore = (() => {
     if (!usable.length || !(budgetMs > 0)) return [];
     const items = [];
     let acc = 0;
+    const len = lengthOf(trims);
     for (let guard = 0; (items.length === 0 || acc < budgetMs - slack) && guard < 10000; guard++) {
       const pool = cycler.candidates();
       const remaining = budgetMs - acc;
-      const len = (t) => trackBounds(t, trims).length;
       let idx = -1;
       if (smartFit) {
         const ok = () => true;
@@ -234,7 +255,7 @@ const PlaylistPlusCore = (() => {
     const cycler = new SongCycler(tracks, { shuffle, rng, memory });
     const usable = cycler.songs;
     if (!usable.length || !(targetMs > 0)) return [];
-    const len = (t) => trackBounds(t, trims).length;
+    const len = lengthOf(trims);
     const lens = usable.map(len).sort((a, b) => a - b);
     const minLen = lens[0];
     const typical = lens[Math.floor(lens.length / 2)];
@@ -259,18 +280,19 @@ const PlaylistPlusCore = (() => {
     // Best way to finish from here: stop now, or one, two or (small playlists) three more songs.
     const bestFinish = (R) => {
       const c = candidates(R);
+      const L = c.map(len);
+      const K = c.map(songKey);
       let best = { err: Math.abs(R), picks: [] };
-      for (const t of c) {
-        const e = Math.abs(R - len(t));
-        if (e < best.err) best = { err: e, picks: [t] };
+      for (let i = 0; i < c.length; i++) {
+        const e = Math.abs(R - L[i]);
+        if (e < best.err) best = { err: e, picks: [c[i]] };
       }
       if (best.err > 3000) {
-        for (let i = 0; i < c.length; i++) {
-          const li = len(c[i]);
-          if (li >= R) continue;
+        for (let i = 0; i < c.length && best.err > 1000; i++) {
+          if (L[i] >= R) continue;
           for (let j = 0; j < c.length; j++) {
-            if (i === j || songKey(c[i]) === songKey(c[j])) continue;
-            const e = Math.abs(R - li - len(c[j]));
+            if (i === j || K[i] === K[j]) continue;
+            const e = Math.abs(R - L[i] - L[j]);
             if (e < best.err) best = { err: e, picks: [c[i], c[j]] };
           }
         }
@@ -278,11 +300,11 @@ const PlaylistPlusCore = (() => {
       if (best.err > 3000 && c.length <= 40) {
         for (let i = 0; i < c.length; i++) {
           for (let j = i + 1; j < c.length; j++) {
-            const lij = len(c[i]) + len(c[j]);
-            if (lij >= R || songKey(c[i]) === songKey(c[j])) continue;
+            const lij = L[i] + L[j];
+            if (lij >= R || K[i] === K[j]) continue;
             for (let k = j + 1; k < c.length; k++) {
-              if (songKey(c[k]) === songKey(c[i]) || songKey(c[k]) === songKey(c[j])) continue;
-              const e = Math.abs(R - lij - len(c[k]));
+              if (K[k] === K[i] || K[k] === K[j]) continue;
+              const e = Math.abs(R - lij - L[k]);
               if (e < best.err) best = { err: e, picks: [c[i], c[k], c[j]] };
             }
           }
@@ -1215,8 +1237,8 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
 // Spicetify integration + UI
 // ---------------------------------------------------------------------------
 (async function PlaylistPlus() {
-  // The phone web app loads this file only for the core logic above.
-  if (typeof window === "undefined" || window.PLAYLIST_PLUS_CORE_ONLY) return;
+  // Only runs inside Spotify (Spicetify). The phone app's build uses just the core above.
+  if (typeof window === "undefined") return;
   const ready = () =>
     window.Spicetify &&
     Spicetify.Player &&
@@ -1392,9 +1414,16 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
     return wrap.firstChild;
   }
 
+  // Album art loads only when it scrolls into view (long plans and trim lists).
   function art(url, size, className = "") {
-    const el = h("div", { className: `pp-art ${className}`, style: `width:${size}px;height:${size}px` }, url ? null : icon("note", Math.round(size * 0.45)));
-    if (url) el.style.backgroundImage = `url("${String(url).replace(/"/g, "%22")}")`;
+    const el = h("div", { className: `pp-art ${className}`, style: `width:${size}px;height:${size}px` });
+    if (!url) {
+      el.append(icon("note", Math.round(size * 0.45)));
+      return el;
+    }
+    const img = h("img", { src: url, alt: "", loading: "lazy", decoding: "async", draggable: "false" });
+    img.addEventListener("error", () => fill(el, icon("note", Math.round(size * 0.45))), { once: true });
+    el.append(img);
     return el;
   }
 
@@ -1437,7 +1466,8 @@ if (typeof window !== "undefined") window.PlaylistPlusCore = PlaylistPlusCore;
     .pp .pp-icon-btn:disabled { opacity: .3; cursor: default; }
     .pp .pp-fab { width: 56px; height: 56px; border: 0; border-radius: 50%; background: var(--pp-green); color: #000; display: grid; place-items: center; cursor: pointer; box-shadow: 0 8px 8px rgba(0,0,0,.3); transition: transform .1s; }
     .pp .pp-fab:hover { transform: scale(1.04); }
-    .pp .pp-art { flex: none; border-radius: 4px; background: #282828 center/cover no-repeat; display: grid; place-items: center; color: #7f7f7f; box-shadow: 0 4px 12px rgba(0,0,0,.35); }
+    .pp .pp-art { flex: none; border-radius: 4px; background: #282828; display: grid; place-items: center; color: #7f7f7f; box-shadow: 0 4px 12px rgba(0,0,0,.35); overflow: hidden; }
+    .pp .pp-art img { display: block; width: 100%; height: 100%; object-fit: cover; }
     .pp .pp-hero { margin: -8px -8px 0; padding: 20px 20px 24px; border-radius: 8px; background: linear-gradient(180deg, color-mix(in srgb, var(--c) 70%, transparent), transparent); display: flex; align-items: flex-end; gap: 16px; }
     .pp .pp-phase { position: relative; border-radius: 8px; padding: 12px 12px 12px 18px; margin: 8px 0; background: linear-gradient(90deg, color-mix(in srgb, var(--c) 26%, #1f1f1f), #1f1f1f 70%); overflow: hidden; display: grid; grid-template-columns: 140px minmax(0, 1fr) 196px 72px; gap: 10px; align-items: center; }
     .pp .pp-phase::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--c); }

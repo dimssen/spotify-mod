@@ -180,44 +180,133 @@
   const smallArt = (images) => (images && images.length ? (images.find((i) => i.width && i.width <= 300) || images[images.length - 1]).url : null);
   const trackArt = (t) => smallArt((t.album && t.album.images) || t.images);
 
+  // ----- caches (kept on the phone, so things show instantly next time) -----
+  const CACHE = { playlists: "playlist-plus:cache:playlists", tracks: "playlist-plus:cache:tracks:", tracksIndex: "playlist-plus:cache:tracks-index" };
+  const MAX_CACHED_PLAYLISTS = 25;
+  // Saving a cache must never break the app: if storage is full, drop old song lists and retry once.
+  function cacheSave(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+      return true;
+    } catch {
+      const index = load(CACHE.tracksIndex, []);
+      for (const e of index.splice(0, Math.ceil(index.length / 2))) localStorage.removeItem(CACHE.tracks + e.id);
+      save(CACHE.tracksIndex, index);
+      try {
+        localStorage.setItem(key, JSON.stringify(value));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+
   let me = null;
   let playlistsCache = null;
+  let playlistsRefresh = null;
+  const playlistsListeners = new Set(); // open screens that want the refreshed list
+
+  function refreshPlaylists() {
+    playlistsRefresh =
+      playlistsRefresh ||
+      (async () => {
+        try {
+          me = me || (await api("GET", "/me"));
+          const all = await getAll("/me/playlists?limit=50");
+          // Spotify only lets apps read the songs of playlists you own or collaborate on.
+          playlistsCache = all
+            .filter(Boolean)
+            .map((p) => ({
+              uri: p.uri,
+              id: p.id,
+              name: p.name,
+              art: smallArt(p.images),
+              total: (p.items && p.items.total) ?? (p.tracks && p.tracks.total) ?? null,
+              readable: p.collaborative || (p.owner && p.owner.id === me.id),
+            }));
+          cacheSave(CACHE.playlists, { at: Date.now(), me: me.id, items: playlistsCache });
+          playlistsListeners.forEach((fn) => fn(playlistsCache));
+          return playlistsCache;
+        } finally {
+          playlistsRefresh = null;
+        }
+      })();
+    return playlistsRefresh;
+  }
+
+  /** Your playlists. Shows the saved list at once (if recent) and refreshes it in the background. */
   async function listPlaylists(force) {
     if (playlistsCache && !force) return playlistsCache;
-    me = me || (await api("GET", "/me"));
-    const all = await getAll("/me/playlists?limit=50");
-    // Spotify only lets apps read the songs of playlists you own or collaborate on.
-    playlistsCache = all
-      .filter(Boolean)
-      .map((p) => ({
-        uri: p.uri,
-        id: p.id,
-        name: p.name,
-        art: smallArt(p.images),
-        total: (p.items && p.items.total) ?? (p.tracks && p.tracks.total) ?? null,
-        readable: p.collaborative || (p.owner && p.owner.id === me.id),
-      }));
-    return playlistsCache;
+    const saved = !force && load(CACHE.playlists, null);
+    if (saved && Date.now() - saved.at < 24 * 3600 * 1000 && Array.isArray(saved.items)) {
+      playlistsCache = saved.items;
+      refreshPlaylists().catch(() => {});
+      return playlistsCache;
+    }
+    return refreshPlaylists();
   }
 
   const isPlayableUri = (uri) => typeof uri === "string" && (uri.startsWith("spotify:track:") || uri.startsWith("spotify:episode:"));
+  const toTracks = (rows) =>
+    rows
+      .map((r) => r && (r.item || r.track))
+      .filter((t) => t && isPlayableUri(t.uri) && !t.is_local && t.duration_ms > 0)
+      .map((t) => ({ uri: t.uri, name: t.name, artist: (t.artists || []).map((a) => a.name).join(", "), duration: t.duration_ms, art: trackArt(t) }));
+
+  // Ask only for the fields we use (much smaller responses). If Spotify rejects the filter
+  // or it filters out what we need, fall back to the full response.
+  const SONG_FIELDS = "uri,name,duration_ms,is_local,type,artists(name),album(images),images";
+  const ITEM_FIELDS = `next,items(item(${SONG_FIELDS}),track(${SONG_FIELDS}))`;
+  async function fetchPlaylistRows(id) {
+    const base = `/playlists/${id}/items?limit=50&additional_types=track,episode`;
+    try {
+      const rows = await getAll(`${base}&fields=${encodeURIComponent(ITEM_FIELDS)}`);
+      if (!rows.length || toTracks(rows).length) return rows;
+    } catch (e) {
+      if (e.status === 401 || e.status === 403 || e.status === 404) throw e;
+    }
+    return getAll(base);
+  }
+
   const trackCache = {};
+  /**
+   * The songs of a playlist. Saved on the phone with the playlist's snapshot id (which
+   * changes whenever the playlist is edited), so an unchanged playlist costs one tiny request.
+   */
   async function loadPlaylistTracks(uri) {
     if (trackCache[uri]) return trackCache[uri];
     const id = uri.split(":").pop();
+    let snapshot = null;
+    try {
+      const meta = await api("GET", `/playlists/${id}?fields=snapshot_id`);
+      snapshot = meta && meta.snapshot_id;
+    } catch {
+      /* no snapshot: just load the songs */
+    }
+    const saved = snapshot && load(CACHE.tracks + id, null);
+    if (saved && saved.snapshot === snapshot && Array.isArray(saved.tracks)) {
+      trackCache[uri] = saved.tracks;
+      rememberCachedPlaylist(id);
+      return saved.tracks;
+    }
     let rows;
     try {
-      rows = await getAll(`/playlists/${id}/items?limit=50&additional_types=track,episode`);
+      rows = await fetchPlaylistRows(id);
     } catch (e) {
       if (e.status === 403 || e.status === 404) throw new Error("Spotify won't share this playlist's songs. Use a playlist you created (you can copy songs into a new one).");
       throw e;
     }
-    const tracks = rows
-      .map((r) => r.item || r.track)
-      .filter((t) => t && isPlayableUri(t.uri) && !t.is_local && t.duration_ms > 0)
-      .map((t) => ({ uri: t.uri, name: t.name, artist: (t.artists || []).map((a) => a.name).join(", "), duration: t.duration_ms, art: trackArt(t) }));
+    const tracks = toTracks(rows);
     trackCache[uri] = tracks;
+    if (snapshot && cacheSave(CACHE.tracks + id, { snapshot, tracks })) rememberCachedPlaylist(id);
     return tracks;
+  }
+  // Keep only the most recently used song lists.
+  function rememberCachedPlaylist(id) {
+    const index = load(CACHE.tracksIndex, []).filter((e) => e.id !== id);
+    index.push({ id, at: Date.now() });
+    while (index.length > MAX_CACHED_PLAYLISTS) localStorage.removeItem(CACHE.tracks + index.shift().id);
+    save(CACHE.tracksIndex, index);
   }
 
   // ----- player adapter over the Web API -------------------------------------
@@ -356,10 +445,19 @@
     },
   };
 
+  const songInfo = new Map();
   async function getTrack(uri) {
-    const [, type, id] = uri.split(":");
-    const t = await api("GET", `/${type === "episode" ? "episodes" : "tracks"}/${id}`);
-    return { uri, name: t.name, artist: (t.artists || []).map((a) => a.name).join(", "), duration: t.duration_ms, art: trackArt(t) };
+    if (!songInfo.has(uri)) {
+      const [, type, id] = uri.split(":");
+      songInfo.set(
+        uri,
+        api("GET", `/${type === "episode" ? "episodes" : "tracks"}/${id}`).then(
+          (t) => ({ uri, name: t.name, artist: (t.artists || []).map((a) => a.name).join(", "), duration: t.duration_ms, art: trackArt(t) }),
+          (e) => (songInfo.delete(uri), Promise.reject(e)),
+        ),
+      );
+    }
+    return songInfo.get(uri);
   }
 
   const playlistMeta = {};
@@ -402,14 +500,85 @@
     return wrap.firstChild;
   }
 
+  // Album art loads only when it's about to scroll into view (lazy), decoded off the main thread.
   function art(url, size, extra = {}) {
-    const el = h("div", { className: "art" + (extra.className ? " " + extra.className : ""), style: size ? `width:${size}px;height:${size}px` : null }, url ? null : icon("note"));
-    if (url) el.style.backgroundImage = `url("${url.replace(/"/g, "%22")}")`;
+    const el = h("div", { className: "art" + (extra.className ? " " + extra.className : ""), style: size ? `width:${size}px;height:${size}px` : null });
+    if (!url) {
+      el.append(icon("note"));
+      return el;
+    }
+    const img = h("img", { src: url, alt: "", loading: extra.eager ? "eager" : "lazy", decoding: "async", draggable: "false" });
+    img.addEventListener("error", () => fill(el, icon("note")), { once: true });
+    el.append(img);
     return el;
   }
 
-  const setHero = (color) => document.documentElement.style.setProperty("--hero", color);
-  const setMini = (color) => document.documentElement.style.setProperty("--mini", color);
+  // Only touch styles/text when the value actually changes (avoids needless style recalcs).
+  const styleVars = {};
+  const setVar = (name, value) => {
+    if (styleVars[name] === value) return;
+    styleVars[name] = value;
+    document.documentElement.style.setProperty(name, value);
+  };
+  const setHero = (color) => setVar("--hero", color);
+  const setMini = (color) => setVar("--mini", color);
+  const setText = (el, text) => {
+    if (el.textContent !== text) el.textContent = text;
+  };
+
+  const debounce = (fn, ms) => {
+    let t;
+    return (...args) => {
+      clearTimeout(t);
+      t = setTimeout(() => fn(...args), ms);
+    };
+  };
+  // At most once per frame, with the latest arguments.
+  const perFrame = (fn) => {
+    let queued = false;
+    let last;
+    return (...args) => {
+      last = args;
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => {
+        queued = false;
+        fn(...last);
+      });
+    };
+  };
+
+  /** Grey placeholder rows/tiles shown while something loads. */
+  const skeletonRows = (n = 6, size = 48) =>
+    Array.from({ length: n }, () =>
+      h("div", { className: "item skel-row", "aria-hidden": "true" },
+        h("div", { className: "art skel", style: `width:${size}px;height:${size}px` }),
+        h("div", { className: "grow" }, h("div", { className: "skel bar" }), h("div", { className: "skel bar short" })),
+      ),
+    );
+  const skeletonTiles = (n = 4) =>
+    Array.from({ length: n }, () =>
+      h("div", { style: "width:120px;flex:none", "aria-hidden": "true" }, h("div", { className: "art skel", style: "width:120px;height:120px" }), h("div", { className: "skel bar", style: "margin-top:10px" })),
+    );
+  const loadingList = (n, size) => h("div", { className: "list", role: "status", "aria-label": "Loading" }, skeletonRows(n, size));
+
+  /** A long list shown 50 rows at a time, with a "Show more" button. */
+  function pagedList(items, renderRow, pageSize = 50) {
+    const list = h("div", { className: "list" });
+    const more = h("button", { className: "btn outline small", style: "margin:12px auto 0;display:flex" });
+    let shown = 0;
+    const page = () => {
+      const next = items.slice(shown, shown + pageSize);
+      shown += next.length;
+      list.append(...toNodes(next.map(renderRow)));
+      const left = items.length - shown;
+      if (left > 0) more.textContent = `Show ${Math.min(left, pageSize)} more (${left} left)`;
+      else more.remove();
+    };
+    more.addEventListener("click", page);
+    page();
+    return h("div", null, list, items.length > pageSize && more);
+  }
 
   function toggle(checked, onChange) {
     return h("label", { className: "switch" }, h("input", { type: "checkbox", checked, onChange: (e) => onChange(e.target.checked) }), h("span"));
@@ -539,7 +708,7 @@
     const input = h("input", { className: "field", placeholder: "Paste your Client ID", autocapitalize: "off", autocomplete: "off", spellcheck: "false" });
     const step = (n, ...content) => h("div", { className: "step" }, h("span", { className: "n" }, n), h("div", null, ...content));
     return h("div", { className: "welcome" },
-      h("img", { className: "logo", src: "icon-180.png", alt: "" }),
+      h("img", { className: "logo", src: "icon.svg", alt: "", width: "88", height: "88" }),
       h("h1", null, "Playlist Plus"),
       h("p", { className: "sub" }, "One-time setup, about 3 minutes. Spotify asks every app to have its own free key. Easiest on a computer."),
       fatal && h("div", { className: "err" }, fatal),
@@ -564,7 +733,7 @@
 
   function loginScreen() {
     return h("div", { className: "welcome" },
-      h("img", { className: "logo", src: "icon-180.png", alt: "" }),
+      h("img", { className: "logo", src: "icon.svg", alt: "", width: "88", height: "88" }),
       h("h1", null, "Trim songs.", h("br"), "Time your playlists."),
       h("p", { className: "sub" }, "Playlist Plus controls the Spotify app on your phone. Spotify Premium required."),
       fatal && h("div", { className: "err" }, fatal),
@@ -659,6 +828,7 @@
     const timeline = h("div");
     let busy = false;
 
+    const updateTimelineSoon = perFrame(() => updateTimeline());
     const updateTimeline = () => {
       setHero(phaseColor(0));
       let budgets;
@@ -685,7 +855,7 @@
           tpl.totalMin = Number(e.target.value);
           e.target.style.setProperty("--pct", `${((tpl.totalMin - 5) / 175) * 100}%`);
           lengthLabel.textContent = `${tpl.totalMin} min`;
-          updateTimeline();
+          updateTimelineSoon();
         },
         onChange: persist,
       });
@@ -958,15 +1128,15 @@
   function pickPlaylist(phaseName) {
     return new Promise((resolve) => {
       let result = null;
-      const listEl = h("div", { className: "list" }, h("div", { className: "empty" }, "Loading your playlists…"));
-      const search = h("input", { className: "field", placeholder: "Search your playlists", autocomplete: "off", onInput: () => draw() });
+      const listEl = h("div", null, loadingList(6, 52));
+      const search = h("input", { className: "field", placeholder: "Search your playlists", autocomplete: "off", onInput: debounce(() => draw(), 120) });
       const link = h("input", { className: "field", placeholder: "Paste a playlist link", autocapitalize: "off", autocomplete: "off" });
       let all = [];
       const draw = () => {
         const q = search.value.trim().toLowerCase();
         const shown = all.filter((p) => p.readable && p.name.toLowerCase().includes(q));
         fill(listEl, shown.length
-          ? shown.map((p) => h("button", { className: "item", onClick: () => ((result = p.uri), close()) },
+          ? pagedList(shown, (p) => h("button", { className: "item", onClick: () => ((result = p.uri), close()) },
               art(p.art, 52),
               h("div", { className: "grow" }, h("div", { className: "t ellipsis" }, p.name), h("div", { className: "s" }, `Playlist${p.total != null ? ` · ${p.total} songs` : ""}`)),
             ))
@@ -987,7 +1157,10 @@
             close();
           } }, "Use"),
         ),
-      ), { onClose: () => resolve(result) });
+      ), { onClose: () => (playlistsListeners.delete(onFresh), resolve(result)) });
+      // If the saved list was shown first, redraw when the fresh one arrives.
+      const onFresh = (p) => ((all = p), draw());
+      playlistsListeners.add(onFresh);
       listPlaylists()
         .then((p) => ((all = p), draw()))
         .catch((e) => fill(listEl, h("div", { className: "err" }, `Couldn't load your playlists: ${e.message}`)));
@@ -1032,7 +1205,7 @@
         ),
         (r.sub = h("div", { className: "sub", style: "margin-top:6px" })),
         h("div", { className: "timeline big" }, segs),
-        art((playing && playing.bigArt) || item.art, null, { className: "big-art" }),
+        art((playing && playing.bigArt) || item.art, null, { className: "big-art", eager: true }),
         h("div", { className: "row", style: "margin-top:20px" },
           art((playing && playing.art) || item.art, 56, { className: "small-art" }),
           h("div", { className: "grow" },
@@ -1066,8 +1239,8 @@
       );
     }
     const r = live.refs;
-    r.countdown.textContent = formatTime(st.phaseLeft);
-    r.sub.textContent = `left in ${st.phaseName} · ${formatTime(st.totalLeft)} left in session`;
+    setText(r.countdown, formatTime(st.phaseLeft));
+    setText(r.sub, `left in ${st.phaseName} · ${formatTime(st.totalLeft)} left in session`);
     const needed = runner.needsApp();
     if (r.appNote.dataset.needed !== String(needed)) {
       r.appNote.dataset.needed = String(needed);
@@ -1082,7 +1255,7 @@
     }
     if (r.nextLabel) {
       const np = runner.phases[st.phaseIdx + 1];
-      r.nextLabel.textContent = st.changesAfterThisSong ? `${np.name} starts after this song` : `Next: ${np.name} in ${formatTime(st.phaseLeft)}`;
+      setText(r.nextLabel, st.changesAfterThisSong ? `${np.name} starts after this song` : `Next: ${np.name} in ${formatTime(st.phaseLeft)}`);
     }
     runner.phases.forEach((p, i) => {
       const pct = i < st.phaseIdx ? 100 : i > st.phaseIdx ? 0 : Math.min(100, ((p.budget - st.phaseLeft) / p.budget) * 100);
@@ -1092,8 +1265,8 @@
     const pos = s && s.uri === item.uri ? player.progress() : item.start;
     const pct = Math.max(0, Math.min(1, (pos - item.start) / Math.max(1, item.end - item.start)));
     r.songFill.style.width = `${pct * 100}%`;
-    r.times.children[0].textContent = formatTime(Math.max(0, pos - item.start));
-    r.times.children[1].textContent = `-${formatTime(Math.max(0, item.end - pos))}`;
+    setText(r.times.children[0], formatTime(Math.max(0, pos - item.start)));
+    setText(r.times.children[1], `-${formatTime(Math.max(0, item.end - pos))}`);
   }
 
   // ----- trims ----------------------------------------------------------------------
@@ -1132,8 +1305,9 @@
       plays.textContent = formatTime(end - start);
       err.textContent = "";
     };
-    rs.addEventListener("input", () => ((start = Math.min(Number(rs.value), end - 5000)), update()));
-    re.addEventListener("input", () => ((end = Math.max(Number(re.value), start + 5000)), update()));
+    const updateSoon = perFrame(update);
+    rs.addEventListener("input", () => ((start = Math.min(Number(rs.value), end - 5000)), updateSoon()));
+    re.addEventListener("input", () => ((end = Math.max(Number(re.value), start + 5000)), updateSoon()));
     const fromField = (input, which) => () => {
       const v = parseTime(input.value);
       if (v == null || Number.isNaN(v)) return update();
@@ -1214,7 +1388,7 @@
     let openUri = null;
 
     const loadShelf = async () => {
-      fill(shelf, h("span", { className: "tiny" }, "Loading your playlists…"));
+      fill(shelf, skeletonTiles(4));
       try {
         const pls = (await listPlaylists()).filter((p) => p.readable);
         if (!pls.length) return fill(shelf, h("span", { className: "tiny" }, "No playlists of your own yet."));
@@ -1225,10 +1399,11 @@
               return fill(songs);
             }
             openUri = p.uri;
-            fill(songs, h("div", { className: "empty" }, "Loading songs…"));
+            fill(songs, h("h2", { style: "margin-top:16px" }, p.name), loadingList(8, 48));
             try {
               const tracks = await loadPlaylistTracks(p.uri);
-              fill(songs, h("h2", { style: "margin-top:16px" }, p.name), tracks.map((tr) => songRow(tr, trims[tr.uri] ? trimLabel(trims[tr.uri]) : formatTime(tr.duration))));
+              if (openUri !== p.uri) return; // another playlist was tapped meanwhile
+              fill(songs, h("h2", { style: "margin-top:16px" }, p.name), pagedList(tracks, (tr) => songRow(tr, trims[tr.uri] ? trimLabel(trims[tr.uri]) : formatTime(tr.duration))));
             } catch (e) {
               fill(songs, h("div", { className: "err" }, e.message));
             }
@@ -1262,7 +1437,7 @@
       (live.nowCard = h("div", { className: "card", style: "margin-top:20px;display:flex;align-items:center;gap:12px" })),
       h("h2", null, "Trimmed songs"),
       entries.length
-        ? h("div", { className: "list" }, entries.map(([uri, tr]) => songRow({ uri, name: tr.name || uri, artist: tr.artist, art: tr.art, duration: null }, trimLabel(tr), true)))
+        ? pagedList(entries, ([uri, tr]) => songRow({ uri, name: tr.name || uri, artist: tr.artist, art: tr.art, duration: null }, trimLabel(tr), true))
         : h("div", { className: "empty" }, icon("scissors"), "No trims yet. Trim the song that's playing, or pick one from your playlists below."),
       h("h2", null, "Your playlists"),
       shelf,
@@ -1317,7 +1492,7 @@
 
     const deviceIcon = (type) => icon(type === "Computer" ? "computer" : type === "Smartphone" ? "phone" : "speaker");
     const drawDevices = async () => {
-      fill(devBox, h("div", { className: "tiny", style: "padding:12px 0" }, "Looking for devices…"));
+      fill(devBox, loadingList(2, 40));
       try {
         const { devices } = await api("GET", "/me/player/devices");
         fill(devBox,
